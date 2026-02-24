@@ -7,9 +7,13 @@ services:
       WENKU_COOKIES: ${WENKU_COOKIES}
       # 可选：仅在使用 steel 模式时需要
       STEEL_API_KEY: ${STEEL_API_KEY:-}
+      # steel / playwright / requests（推荐 steel）
+      SCRAPER: ${SCRAPER:-steel}
+      # 6 小时 = 21600 秒
+      RUN_INTERVAL_SECONDS: ${RUN_INTERVAL_SECONDS:-21600}
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./out:/app/out
       - ./docs:/app/docs
-    command: ["python", "main.py", "playwright"]
-    restart: "no"
+    command: ["sh", "/app/run_scheduler.sh"]
+    restart: unless-stopped

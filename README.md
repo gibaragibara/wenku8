@@ -103,13 +103,19 @@ python main.py playwright
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填写 WENKU_COOKIES
+# 编辑 .env，填写 WENKU_COOKIES（默认每 6 小时跑一次）
 cp docker-compose.yml.example docker-compose.yml
 # 编辑 docker-compose.yml，把镜像名改成你的 Docker Hub 仓库
 docker compose --env-file .env up -d
 ```
 
-静态页面会输出到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。
+运行模式：
+
+- 容器常驻运行
+- 每 `RUN_INTERVAL_SECONDS` 秒执行一次：`txt.py` + `main.py $SCRAPER`
+- 有新内容时自动下载蓝奏“合集”压缩包并重命名
+
+静态页面会持续更新到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。
 
 ## GitHub DockerHub CI
 
