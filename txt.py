@@ -64,7 +64,12 @@ def incremental_scrape():
 def merge_csv():
     all_dfs = []
     for repo in ALL_REPOS:
-        df = pd.read_csv(os.path.join(TXT_DIR, f"{repo}.csv"))
+        csv_path = os.path.join(TXT_DIR, f"{repo}.csv")
+        if not os.path.exists(csv_path):
+            print(f"[INFO] Missing csv for {repo}, scraping once before merge")
+            scrape_repo(repo)
+            time.sleep(1)
+        df = pd.read_csv(csv_path)
         all_dfs.append(df)
     merged_df = pd.concat(all_dfs, ignore_index=True)
     merged_df = merged_df.drop_duplicates(subset=["title", "author"], keep="last")
