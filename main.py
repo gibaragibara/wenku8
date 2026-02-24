@@ -135,37 +135,66 @@ def init_steel():
         playwright_ctx_cookie_dict = dict(COOKIE_DICT)
     return browser
 
+def reset_browser_state(release_steel: bool = True):
+    global browser, steel_dict
+    try:
+        if browser is not None:
+            browser.close()
+    except Exception:
+        pass
+    finally:
+        browser = None
+
+    if release_steel and steel_dict:
+        try:
+            steel_dict['client'].sessions.release(steel_dict['session_id'])
+        except Exception:
+            pass
+        steel_dict = None
+
 def exit_steel():
-    browser.close()
-    client = steel_dict['client']
-    session_id = steel_dict['session_id']
-    client.sessions.release(session_id)
+    reset_browser_state(release_steel=True)
 
 def scrape_page_playwright(url: str):
     global browser, playwright_ctx_cookie_dict
-    if browser is None:
-        browser = (init_steel() if _scraper == 'steel' else init_playwright())
-    # 每次新建 context，并注入 cookie
-    with browser.new_context() as context:
-        if playwright_ctx_cookie_dict:
-            cookies = [
-                {
-                    "name": k,
-                    "value": v,
-                    "domain": "www.wenku8.net",
-                    "path": "/",
-                    # 可按需设置 "httpOnly" / "secure" / "sameSite"
-                }
-                for k, v in playwright_ctx_cookie_dict.items()
-            ]
-            context.add_cookies(cookies)
-        page = context.new_page()
-        page.goto(url, wait_until='networkidle')
-        if "/login.php" in page.url:
-            raise ValueError(f"[ERROR] Playwright 模式被重定向到登录页，可能需要更新 COOKIE 文件: {page.url}")
-        html_content = page.content()
-        page.close()
-    return html_content
+    last_err = None
+    for attempt in range(3):
+        try:
+            if browser is None:
+                browser = (init_steel() if _scraper == 'steel' else init_playwright())
+            # 每次新建 context，并注入 cookie
+            with browser.new_context() as context:
+                if playwright_ctx_cookie_dict:
+                    cookies = [
+                        {
+                            "name": k,
+                            "value": v,
+                            "domain": "www.wenku8.net",
+                            "path": "/",
+                            # 可按需设置 "httpOnly" / "secure" / "sameSite"
+                        }
+                        for k, v in playwright_ctx_cookie_dict.items()
+                    ]
+                    context.add_cookies(cookies)
+                page = context.new_page()
+                page.goto(url, wait_until='networkidle', timeout=45000)
+                if "/login.php" in page.url:
+                    raise ValueError(f"[ERROR] Playwright 模式被重定向到登录页，可能需要更新 COOKIE 文件: {page.url}")
+                html_content = page.content()
+                page.close()
+                return html_content
+        except ValueError:
+            raise
+        except Exception as e:
+            last_err = e
+            # Steel 会话偶发断连时重建会话后重试
+            if _scraper == 'steel':
+                print(f'[WARN] steel page fetch failed (attempt {attempt + 1}/3): {e}')
+                reset_browser_state(release_steel=True)
+            if attempt < 2:
+                time.sleep(1.5 + attempt)
+                continue
+    raise last_err
 
 def scrape_page_requests(url: str):
     resp = session.get(url, timeout=10, allow_redirects=True)
@@ -331,26 +360,27 @@ def scrape():
     all_entries = []
     stop = False
 
-    # 先爬第一页
-    print('[INFO] scrape (1)')
-    entries, found = parse_page(1, latest_post_link)
-    all_entries.extend(entries)
-    stop = found
-
-    # 继续爬剩余页数，直到遇到已存在帖子
-    page = 2
-    while not stop and page <= last_page:
-        print(f'[INFO] scrape ({page}/{last_page})')
-        entries, found = parse_page(page, latest_post_link)
+    try:
+        # 先爬第一页
+        print('[INFO] scrape (1)')
+        entries, found = parse_page(1, latest_post_link)
         all_entries.extend(entries)
         stop = found
-        if stop:
-            break
-        page += 1
-        time.sleep(random.uniform(1, 3))
-    
-    if _scraper == 'steel':
-        exit_steel() # close Steel session
+
+        # 继续爬剩余页数，直到遇到已存在帖子
+        page = 2
+        while not stop and page <= last_page:
+            print(f'[INFO] scrape ({page}/{last_page})')
+            entries, found = parse_page(page, latest_post_link)
+            all_entries.extend(entries)
+            stop = found
+            if stop:
+                break
+            page += 1
+            time.sleep(random.uniform(1, 3))
+    finally:
+        if _scraper == 'steel':
+            exit_steel() # close Steel session
 
     # 新内容在前，拼接后写入
     # with open(POST_LIST_FILE, 'w', encoding='utf-8', newline='') as f:
