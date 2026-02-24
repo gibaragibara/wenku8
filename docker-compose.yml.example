@@ -13,3 +13,14 @@ services:
       - ./docs:/app/docs
     command: ["python", "main.py", "playwright"]
     restart: "no"
+
+  web:
+    image: nginx:alpine
+    container_name: wenku8-web
+    depends_on:
+      - wenku8
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docs:/usr/share/nginx/html:ro
+    restart: unless-stopped

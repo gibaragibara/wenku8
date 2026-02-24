@@ -19,13 +19,13 @@ params = { 'keyword': '8691', 'charset': 'utf-8', 'page': 1 }
 # 'requests' | 'playwright' | 'steel'
 _scraper = 'steel'
 user_agents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15'
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15',
 ]
 HEADERS = { 
     # 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
@@ -240,10 +240,35 @@ def get_latest(url: str):
 def parse_page(page_num: int, latest_post_link: str = None):
     params['page'] = page_num
     url = build_url_with_params(BASE_URL, params)
-    txt = scrape_page(url)
-    # print(txt)
-    soup = BeautifulSoup(txt, 'html.parser')
-    table = soup.find_all('table', class_='grid')[1]
+    txt = ''
+    soup = None
+    table = None
+    for attempt in range(3):
+        txt = scrape_page(url)
+        soup = BeautifulSoup(txt, 'html.parser')
+        tables = soup.find_all('table', class_='grid')
+        if len(tables) >= 2:
+            table = tables[1]
+            break
+        if attempt < 2:
+            wait_s = 2 + attempt * 2
+            print(f'[WARN] parse_page({page_num}) failed on attempt {attempt + 1}, retry in {wait_s}s')
+            time.sleep(wait_s)
+    if table is None:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        debug_html = os.path.join(OUT_DIR, f'debug_reviewslist_page_{page_num}.html')
+        with open(debug_html, 'w', encoding='utf-8') as f:
+            f.write(txt)
+        page_title = ''
+        if soup and soup.title and soup.title.string:
+            page_title = soup.title.string.strip()
+        txt_l = txt.lower()
+        if 'cloudflare' in txt_l or 'just a moment' in txt_l or '验证' in txt:
+            raise RuntimeError(f'[ERROR] blocked by anti-bot page, debug saved: {debug_html}, title={page_title}')
+        if '登录' in txt or 'login' in txt_l:
+            raise RuntimeError(f'[ERROR] cookie may be invalid/expired, debug saved: {debug_html}, title={page_title}')
+        raise RuntimeError(f'[ERROR] unexpected page structure, debug saved: {debug_html}, title={page_title}')
+
     rows = table.find_all('tr')[1:]  # skip header row
 
     flg = [False] * 2
