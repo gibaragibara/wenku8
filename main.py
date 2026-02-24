@@ -417,7 +417,7 @@ def scrape():
             lines = lines[:1] + [','.join(entry) + '\n' for entry in all_entries] + lines[1:]
             f.seek(0)
             f.writelines(lines)
-    return all_entries
+    return all_entries, file_exists
 
 # ========== Data Processing ==========
 def purify(text: str) -> str: # 只保留中文、英文和数字
@@ -688,31 +688,49 @@ def first_locator_any_scope(page, selectors):
 
 def fill_lanzou_password(page, pwd: str):
     if not pwd:
+        print('[WARN] Empty lanzou password for this entry, skip password fill.')
         return
-    pwd_loc = first_locator_any_scope(page, [
-        '#pwd',
-        'input[name="pwd"]',
-        'input[type="password"]',
-        'input[id*="pwd"]',
-        'text=输入密码',
-    ])
-    if pwd_loc is None:
-        return
-    pwd_loc.fill(pwd)
-    submit_loc = first_locator_any_scope(page, [
-        '#sub',
-        'button:has-text("确定")',
-        'button:has-text("提取")',
-        'input[type="submit"]',
-        'input[type="button"]',
-        'text=确定',
-        'text=提取',
-    ])
-    if submit_loc is not None:
-        submit_loc.click()
-    else:
-        pwd_loc.press('Enter')
-    page.wait_for_timeout(1200)
+    for _ in range(3):
+        pwd_loc = first_locator_any_scope(page, [
+            '#pwd',
+            'input[name="pwd"]',
+            'input[type="password"]',
+            'input[id*="pwd"]',
+            'input[placeholder*="密码"]',
+            'input:not([type="hidden"])',
+        ])
+        if pwd_loc is not None:
+            try:
+                pwd_loc.fill(pwd)
+            except Exception:
+                pass
+            submit_loc = first_locator_any_scope(page, [
+                '#sub',
+                'button:has-text("确定")',
+                'button:has-text("提取")',
+                'input[type="submit"]',
+                'input[type="button"]',
+                'text=确定',
+                'text=提取',
+            ])
+            if submit_loc is not None:
+                try:
+                    submit_loc.click(force=True)
+                except Exception:
+                    try:
+                        pwd_loc.press('Enter')
+                    except Exception:
+                        pass
+            else:
+                try:
+                    pwd_loc.press('Enter')
+                except Exception:
+                    pass
+            page.wait_for_timeout(1500)
+            print('[INFO] Lanzou password submitted.')
+            return
+        page.wait_for_timeout(800)
+    print('[WARN] Lanzou password input not found, continue without submit.')
 
 def click_and_follow(page, node, timeout_ms: int):
     context = page.context
@@ -842,6 +860,10 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str,
     page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
     fill_lanzou_password(page, pwd)
     bundle_page = select_bundle_file_page(page, timeout_ms)
+    if bundle_page is None and pwd:
+        # 密码页/iframe 异步加载时再尝试一次
+        fill_lanzou_password(page, pwd)
+        bundle_page = select_bundle_file_page(page, timeout_ms)
     if bundle_page is None:
         return None, 'no_bundle'
     normal_page, download = open_normal_download_page(bundle_page, timeout_ms)
@@ -943,18 +965,28 @@ def main():
     if not os.path.exists(PUBLIC_DIR):
         os.mkdir(PUBLIC_DIR)
     
-    new_entries = scrape()
+    new_entries, has_history = scrape()
     merge()
     create_html_merged()
     create_html_epub()
-    # 默认自动下载本次更新中的“合集”压缩包
-    download_lanzou_files(
-        new_entries,
-        DOWNLOAD_DIR,
-        limit=0,
-        timeout_ms=90000,
-        headless=True,
-    )
+    # 首次初始化（无历史 post_list）时，仅尝试最新 1 条用于验证下载链路。
+    if has_history:
+        download_lanzou_files(
+            new_entries,
+            DOWNLOAD_DIR,
+            limit=0,
+            timeout_ms=90000,
+            headless=True,
+        )
+    else:
+        print('[INFO] First bootstrap run detected, only download the latest one for smoke test.')
+        download_lanzou_files(
+            new_entries[:1],
+            DOWNLOAD_DIR,
+            limit=1,
+            timeout_ms=90000,
+            headless=True,
+        )
 
 if __name__ == '__main__':
     args = parse_args()

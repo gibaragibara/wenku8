@@ -114,6 +114,7 @@ docker compose --env-file .env up -d
 - 容器常驻运行
 - 每 `RUN_INTERVAL_SECONDS` 秒执行一次：`txt.py` + `main.py $SCRAPER`
 - 有新内容时自动下载蓝奏“合集”压缩包并重命名
+- 首次初始化（无 `out/post_list.csv`）仅尝试下载最新 1 条用于测试，不会扫历史库存
 
 静态页面会持续更新到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。
 
