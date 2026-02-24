@@ -800,7 +800,10 @@ def select_bundle_file_page(page, timeout_ms: int):
             return click_and_follow(page, bundle_candidates[0], timeout_ms)
     return None
 
-def open_normal_download_page(page, timeout_ms: int):
+def open_normal_download_page(page, deadline_ts: float):
+    left = timeout_left_ms(deadline_ts)
+    if left <= 1:
+        return page, None
     normal_loc = first_locator_any_scope(page, [
         'a:has-text("普通下载")',
         'button:has-text("普通下载")',
@@ -809,14 +812,20 @@ def open_normal_download_page(page, timeout_ms: int):
         'text=普通下载',
     ])
     if normal_loc is None:
+        print('[INFO] Lanzou normal download button not found, try direct resolve.')
         return page, None
-    direct_download = try_click_download(page, normal_loc, timeout_ms=min(timeout_ms, 12000))
+    print('[INFO] Lanzou normal download button found.')
+    direct_download = try_click_download(page, normal_loc, timeout_ms=min(timeout_left_ms(deadline_ts), 8000))
     if direct_download is not None:
+        print('[INFO] Lanzou direct download event captured from normal button.')
         return page, direct_download
-    return click_and_follow(page, normal_loc, timeout_ms), None
+    left = timeout_left_ms(deadline_ts)
+    if left <= 1:
+        return page, None
+    return click_and_follow(page, normal_loc, min(left, 8000)), None
 
-def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
-    if depth > 2:
+def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0):
+    if depth > 2 or timeout_left_ms(deadline_ts) <= 1:
         return None
     verify_loc = first_locator_any_scope(page, [
         'button:has-text("验证并下载")',
@@ -825,6 +834,7 @@ def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
         'text=验证并下载',
     ])
     if verify_loc is not None:
+        print('[INFO] Lanzou verify button found, clicking.')
         try:
             verify_loc.click(force=True)
             page.wait_for_timeout(2200)
@@ -832,6 +842,8 @@ def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
             pass
 
     for _ in range(4):
+        if timeout_left_ms(deadline_ts) <= 1:
+            return None
         for sel in [
             'button:has-text("即刻下载")',
             'button:has-text("立即下载")',
@@ -847,6 +859,8 @@ def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
             'text=即刻下载',
             'text=立即下载',
         ]:
+            if timeout_left_ms(deadline_ts) <= 1:
+                return None
             for scope in all_scopes(page):
                 loc = scope.locator(sel)
                 if loc.count() == 0:
@@ -857,18 +871,23 @@ def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
                         continue
                 except Exception:
                     pass
-                download = try_click_download(page, node, timeout_ms=min(timeout_ms, 15000))
+                click_timeout = min(timeout_left_ms(deadline_ts), 6000)
+                download = try_click_download(page, node, timeout_ms=click_timeout)
                 if download is not None:
+                    print(f'[INFO] Lanzou download event captured by selector: {sel}')
                     return download
                 try:
-                    nxt = click_and_follow(page, node, timeout_ms=min(timeout_ms, 10000))
+                    nxt = click_and_follow(page, node, timeout_ms=min(timeout_left_ms(deadline_ts), 6000))
                     if nxt != page:
-                        nested = resolve_verify_and_download(nxt, timeout_ms, depth + 1)
+                        nested = resolve_verify_and_download(nxt, deadline_ts, depth + 1)
                         if nested is not None:
                             return nested
                 except Exception:
                     continue
-        page.wait_for_timeout(1500)
+        sleep_ms = min(1200, timeout_left_ms(deadline_ts))
+        if sleep_ms <= 1:
+            return None
+        page.wait_for_timeout(sleep_ms)
     return None
 
 def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str, timeout_ms: int):
@@ -887,9 +906,10 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str,
     print('[INFO] Lanzou bundle page found.')
     if timeout_left_ms(deadline_ts) <= 1:
         return None, 'timeout'
-    normal_page, download = open_normal_download_page(bundle_page, min(timeout_left_ms(deadline_ts), 20000))
+    normal_page, download = open_normal_download_page(bundle_page, deadline_ts)
     if download is None:
-        download = resolve_verify_and_download(normal_page, min(timeout_left_ms(deadline_ts), 25000))
+        print('[INFO] Lanzou resolving verify/download flow.')
+        download = resolve_verify_and_download(normal_page, deadline_ts)
     if download is None:
         if timeout_left_ms(deadline_ts) <= 1:
             return None, 'timeout'
