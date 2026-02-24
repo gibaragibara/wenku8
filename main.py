@@ -988,8 +988,32 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
     steel_session_id = ''
     steel_unavailable = False
 
-    def ensure_steel_context(p):
+    def close_steel_fallback():
+        nonlocal steel_ctx, steel_browser, steel_client, steel_session_id
+        if steel_ctx is not None:
+            try:
+                steel_ctx.close()
+            except Exception:
+                pass
+        steel_ctx = None
+        if steel_browser is not None:
+            try:
+                steel_browser.close()
+            except Exception:
+                pass
+        steel_browser = None
+        if steel_client is not None and steel_session_id:
+            try:
+                steel_client.sessions.release(steel_session_id)
+            except Exception:
+                pass
+        steel_client = None
+        steel_session_id = ''
+
+    def ensure_steel_context(p, force_recreate: bool = False):
         nonlocal steel_ctx, steel_browser, steel_client, steel_session_id, steel_unavailable
+        if force_recreate:
+            close_steel_fallback()
         if steel_ctx is not None:
             return steel_ctx
         if steel_unavailable:
@@ -1044,16 +1068,26 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
 
             # local playwright failed, retry once with Steel fallback
             if status != 'ok':
-                steel_context = ensure_steel_context(p)
-                if steel_context is not None:
-                    print(f'[INFO] local playwright failed ({status}), retry with Steel: {url}')
+                print(f'[INFO] local playwright failed ({status}), retry with Steel: {url}')
+                for attempt in range(2):
+                    steel_context = ensure_steel_context(p, force_recreate=(attempt > 0))
+                    if steel_context is None:
+                        break
                     steel_page = steel_context.new_page()
                     try:
                         out2, status2 = download_one_lanzou(steel_page, url, pwd, download_dir, title, timeout_ms)
                         if status2 == 'ok' and out2:
                             out, status = out2, status2
+                        break
                     except Exception as e:
-                        print(f'[WARN] steel fallback failed: {url}: {e}')
+                        err = str(e).lower()
+                        print(f'[WARN] steel fallback failed (attempt {attempt + 1}/2): {url}: {e}')
+                        if ('target page' in err and 'has been closed' in err) or ('target closed' in err):
+                            close_steel_fallback()
+                            if attempt < 1:
+                                print('[INFO] Steel fallback session closed unexpectedly, recreating and retrying.')
+                                continue
+                        break
                     finally:
                         try:
                             steel_page.close()
@@ -1074,21 +1108,7 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
                 print(f'[WARN] no downloadable link found: {url}')
         context.close()
         browser.close()
-        if steel_ctx is not None:
-            try:
-                steel_ctx.close()
-            except Exception:
-                pass
-        if steel_browser is not None:
-            try:
-                steel_browser.close()
-            except Exception:
-                pass
-        if steel_client is not None and steel_session_id:
-            try:
-                steel_client.sessions.release(steel_session_id)
-            except Exception:
-                pass
+        close_steel_fallback()
 
     print(f'[INFO] lanzou download done, success={ok_cnt}, skipped={skip_cnt}, failed={fail_cnt}, dir={download_dir}')
 
