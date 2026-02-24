@@ -44,6 +44,7 @@ MERGED_CSV = os.path.join(OUT_DIR, 'merged.csv')
 EPUB_HTML = os.path.join(PUBLIC_DIR, 'epub.html')
 MERGED_HTML = os.path.join(PUBLIC_DIR, 'index.html')
 DOWNLOAD_DIR = os.path.join(OUT_DIR, 'downloads')
+BOOTSTRAP_MARK_FILE = os.path.join(OUT_DIR, '.bootstrap_done')
 _prefix = ''
 
 retry_strategy = Retry(
@@ -770,6 +771,14 @@ def try_click_download(page, node, timeout_ms: int):
     except Exception:
         return None
 
+def wait_for_async_download(page, timeout_ms: int):
+    if timeout_ms <= 1:
+        return None
+    try:
+        return page.wait_for_event('download', timeout=timeout_ms)
+    except Exception:
+        return None
+
 def select_bundle_file_page(page, timeout_ms: int):
     quick_bundle = first_locator_any_scope(page, [
         'a:has-text("合集.zip")',
@@ -824,22 +833,28 @@ def open_normal_download_page(page, deadline_ts: float):
         return page, None
     return click_and_follow(page, normal_loc, min(left, 8000)), None
 
-def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0):
+def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0, verify_clicked: bool = False):
     if depth > 2 or timeout_left_ms(deadline_ts) <= 1:
         return None
-    verify_loc = first_locator_any_scope(page, [
-        'button:has-text("验证并下载")',
-        'a:has-text("验证并下载")',
-        'input[value="验证并下载"]',
-        'text=验证并下载',
-    ])
-    if verify_loc is not None:
-        print('[INFO] Lanzou verify button found, clicking.')
-        try:
-            verify_loc.click(force=True)
+    if not verify_clicked:
+        verify_loc = first_locator_any_scope(page, [
+            'button:has-text("验证并下载")',
+            'a:has-text("验证并下载")',
+            'input[value="验证并下载"]',
+            'text=验证并下载',
+        ])
+        if verify_loc is not None:
+            print('[INFO] Lanzou verify button found, clicking once.')
+            try:
+                verify_loc.click(force=True)
+            except Exception:
+                pass
             page.wait_for_timeout(2200)
-        except Exception:
-            pass
+            async_dl = wait_for_async_download(page, min(timeout_left_ms(deadline_ts), 9000))
+            if async_dl is not None:
+                print('[INFO] Lanzou async download event captured after verify.')
+                return async_dl
+            verify_clicked = True
 
     for _ in range(4):
         if timeout_left_ms(deadline_ts) <= 1:
@@ -879,9 +894,13 @@ def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0):
                 try:
                     nxt = click_and_follow(page, node, timeout_ms=min(timeout_left_ms(deadline_ts), 6000))
                     if nxt != page:
-                        nested = resolve_verify_and_download(nxt, deadline_ts, depth + 1)
+                        nested = resolve_verify_and_download(nxt, deadline_ts, depth + 1, verify_clicked)
                         if nested is not None:
                             return nested
+                    async_dl = wait_for_async_download(page, min(timeout_left_ms(deadline_ts), 3500))
+                    if async_dl is not None:
+                        print('[INFO] Lanzou async download event captured.')
+                        return async_dl
                 except Exception:
                     continue
         sleep_ms = min(1200, timeout_left_ms(deadline_ts))
@@ -1020,8 +1039,23 @@ def main():
     merge()
     create_html_merged()
     create_html_epub()
-    # 首次初始化（无历史 post_list）时，仅尝试最新 1 条用于验证下载链路。
-    if has_history:
+    first_bootstrap = not os.path.exists(BOOTSTRAP_MARK_FILE)
+    # 首次部署运行时，仅尝试最新 1 条用于验证下载链路（与 post_list 是否存在无关）。
+    if first_bootstrap:
+        print('[INFO] First bootstrap cycle detected, only download the latest one for smoke test.')
+        download_lanzou_files(
+            new_entries[:1],
+            DOWNLOAD_DIR,
+            limit=1,
+            timeout_ms=90000,
+            headless=True,
+        )
+        try:
+            with open(BOOTSTRAP_MARK_FILE, 'w', encoding='utf-8') as f:
+                f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+        except Exception as e:
+            print(f'[WARN] failed to write bootstrap marker: {e}')
+    elif has_history:
         download_lanzou_files(
             new_entries,
             DOWNLOAD_DIR,
@@ -1030,7 +1064,7 @@ def main():
             headless=True,
         )
     else:
-        print('[INFO] First bootstrap run detected, only download the latest one for smoke test.')
+        print('[INFO] No history detected, only download the latest one for smoke test.')
         download_lanzou_files(
             new_entries[:1],
             DOWNLOAD_DIR,
