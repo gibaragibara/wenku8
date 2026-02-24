@@ -93,12 +93,28 @@ if COOKIE_DICT:
 browser = None
 playwright_ctx_cookie_dict = None
 steel_dict = None
+playwright_driver = None
+
+def get_playwright_driver():
+    from playwright.sync_api import sync_playwright
+    global playwright_driver
+    if playwright_driver is None:
+        playwright_driver = sync_playwright().start()
+    return playwright_driver
+
+def shutdown_playwright_driver():
+    global playwright_driver
+    if playwright_driver is not None:
+        try:
+            playwright_driver.stop()
+        except Exception:
+            pass
+        playwright_driver = None
 
 def init_playwright():
-    from playwright.sync_api import sync_playwright
     global browser, playwright_ctx_cookie_dict
     if browser is None:
-        playwright = sync_playwright().start()
+        playwright = get_playwright_driver()
         browser = playwright.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox']
@@ -110,7 +126,6 @@ def init_playwright():
 def init_steel():
     from steel import Steel
     from dotenv import dotenv_values
-    from playwright.sync_api import sync_playwright
     global browser, playwright_ctx_cookie_dict, steel_dict
     steel_api_key = os.getenv('STEEL_API_KEY', '').strip()
     if not steel_api_key:
@@ -127,7 +142,7 @@ def init_steel():
     }
 
     if browser is None:
-        playwright = sync_playwright().start()
+        playwright = get_playwright_driver()
         browser = playwright.chromium.connect_over_cdp(
             f'wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={steel_session.id}'
         )
@@ -381,6 +396,9 @@ def scrape():
     finally:
         if _scraper == 'steel':
             exit_steel() # close Steel session
+        else:
+            reset_browser_state(release_steel=False)
+        shutdown_playwright_driver()
 
     # 新内容在前，拼接后写入
     # with open(POST_LIST_FILE, 'w', encoding='utf-8', newline='') as f:
