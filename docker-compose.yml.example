@@ -11,6 +11,8 @@ services:
       SCRAPER: ${SCRAPER:-steel}
       # 6 小时 = 21600 秒
       RUN_INTERVAL_SECONDS: ${RUN_INTERVAL_SECONDS:-21600}
+      # 是否自动下载蓝奏合集（true/false）
+      ENABLE_LANZOU_DOWNLOAD: ${ENABLE_LANZOU_DOWNLOAD:-false}
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./out:/app/out

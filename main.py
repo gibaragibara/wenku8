@@ -60,6 +60,17 @@ session.mount('https://', adapter)
 session.headers.update(HEADERS)
 COOKIE_ENV_KEYS = ('WENKU_COOKIES', 'COOKIE')
 
+def read_bool_env(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ('1', 'true', 'yes', 'on'):
+        return True
+    if v in ('0', 'false', 'no', 'off'):
+        return False
+    return default
+
 def parse_cookie_line(line: str):
     line = line.strip()
     if not line:
@@ -1341,6 +1352,10 @@ def main():
     merge()
     create_html_merged()
     create_html_epub()
+    if not read_bool_env('ENABLE_LANZOU_DOWNLOAD', True):
+        print('[INFO] ENABLE_LANZOU_DOWNLOAD=false, skip lanzou auto download.')
+        return
+
     first_bootstrap = not os.path.exists(BOOTSTRAP_MARK_FILE)
     # 首次部署运行时，仅尝试最新 1 条用于验证下载链路（与 post_list 是否存在无关）。
     if first_bootstrap:
