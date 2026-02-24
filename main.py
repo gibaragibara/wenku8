@@ -96,6 +96,13 @@ playwright_ctx_cookie_dict = None
 steel_dict = None
 playwright_driver = None
 
+def get_steel_api_key() -> str:
+    from dotenv import dotenv_values
+    steel_api_key = os.getenv('STEEL_API_KEY', '').strip()
+    if not steel_api_key:
+        steel_api_key = dotenv_values().get('STEEL_API_KEY', '').strip()
+    return steel_api_key
+
 def get_playwright_driver():
     from playwright.sync_api import sync_playwright
     global playwright_driver
@@ -126,11 +133,8 @@ def init_playwright():
 
 def init_steel():
     from steel import Steel
-    from dotenv import dotenv_values
     global browser, playwright_ctx_cookie_dict, steel_dict
-    steel_api_key = os.getenv('STEEL_API_KEY', '').strip()
-    if not steel_api_key:
-        steel_api_key = dotenv_values().get('STEEL_API_KEY', '').strip()
+    steel_api_key = get_steel_api_key()
     if not steel_api_key:
         raise RuntimeError('[ERROR] STEEL_API_KEY is empty. Set env STEEL_API_KEY or provide .env in /app.')
     client = Steel(steel_api_key=steel_api_key)
@@ -978,6 +982,39 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
     ok_cnt = 0
     fail_cnt = 0
     skip_cnt = 0
+    steel_ctx = None
+    steel_browser = None
+    steel_client = None
+    steel_session_id = ''
+    steel_unavailable = False
+
+    def ensure_steel_context(p):
+        nonlocal steel_ctx, steel_browser, steel_client, steel_session_id, steel_unavailable
+        if steel_ctx is not None:
+            return steel_ctx
+        if steel_unavailable:
+            return None
+        steel_api_key = get_steel_api_key()
+        if not steel_api_key:
+            steel_unavailable = True
+            print('[WARN] STEEL_API_KEY is empty, skip Steel fallback for lanzou download.')
+            return None
+        try:
+            from steel import Steel
+            steel_client = Steel(steel_api_key=steel_api_key)
+            steel_session = steel_client.sessions.create(api_timeout=20000)
+            steel_session_id = steel_session.id
+            print(f'[INFO] Running Steel fallback session for lanzou: {steel_session_id}')
+            steel_browser = p.chromium.connect_over_cdp(
+                f'wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={steel_session_id}'
+            )
+            steel_ctx = steel_browser.new_context(accept_downloads=True)
+            return steel_ctx
+        except Exception as e:
+            steel_unavailable = True
+            print(f'[WARN] Failed to init Steel fallback, skip retry: {e}')
+            return None
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
@@ -990,31 +1027,68 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
             title = row.main if (hasattr(row, 'main') and isinstance(row.main, str) and row.main) else f'{label}'
             url = f'https://{prefix}/{label}'
             print(f'[INFO] downloading: {title} ({url})')
+            out = None
+            status = 'no_download'
+
             page = context.new_page()
             try:
                 out, status = download_one_lanzou(page, url, pwd, download_dir, title, timeout_ms)
-                if status == 'ok' and out:
-                    ok_cnt += 1
-                    print(f'[INFO] saved: {out}')
-                elif status == 'no_bundle':
-                    skip_cnt += 1
-                    print(f'[INFO] skip (no 合集 file): {url}')
-                elif status == 'timeout':
-                    fail_cnt += 1
-                    print(f'[WARN] lanzou download timeout: {url}')
-                else:
-                    fail_cnt += 1
-                    print(f'[WARN] no downloadable link found: {url}')
             except Exception as e:
-                fail_cnt += 1
-                print(f'[WARN] failed to download {url}: {e}')
+                status = 'exception'
+                print(f'[WARN] playwright download failed: {url}: {e}')
             finally:
                 try:
                     page.close()
                 except Exception:
                     pass
+
+            # local playwright failed, retry once with Steel fallback
+            if status != 'ok':
+                steel_context = ensure_steel_context(p)
+                if steel_context is not None:
+                    print(f'[INFO] local playwright failed ({status}), retry with Steel: {url}')
+                    steel_page = steel_context.new_page()
+                    try:
+                        out2, status2 = download_one_lanzou(steel_page, url, pwd, download_dir, title, timeout_ms)
+                        if status2 == 'ok' and out2:
+                            out, status = out2, status2
+                    except Exception as e:
+                        print(f'[WARN] steel fallback failed: {url}: {e}')
+                    finally:
+                        try:
+                            steel_page.close()
+                        except Exception:
+                            pass
+
+            if status == 'ok' and out:
+                ok_cnt += 1
+                print(f'[INFO] saved: {out}')
+            elif status == 'no_bundle':
+                skip_cnt += 1
+                print(f'[INFO] skip (no 合集 file): {url}')
+            elif status == 'timeout':
+                fail_cnt += 1
+                print(f'[WARN] lanzou download timeout: {url}')
+            else:
+                fail_cnt += 1
+                print(f'[WARN] no downloadable link found: {url}')
         context.close()
         browser.close()
+        if steel_ctx is not None:
+            try:
+                steel_ctx.close()
+            except Exception:
+                pass
+        if steel_browser is not None:
+            try:
+                steel_browser.close()
+            except Exception:
+                pass
+        if steel_client is not None and steel_session_id:
+            try:
+                steel_client.sessions.release(steel_session_id)
+            except Exception:
+                pass
 
     print(f'[INFO] lanzou download done, success={ok_cnt}, skipped={skip_cnt}, failed={fail_cnt}, dir={download_dir}')
 
