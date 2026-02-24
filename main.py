@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import csv
 import time
 import random
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, unquote
 import sys
 import argparse
 from requests.adapters import HTTPAdapter
@@ -13,6 +13,7 @@ import json
 import os
 import pandas as pd
 import sys
+import html as html_lib
 
 BASE_URL = 'https://www.wenku8.net/modules/article/reviewslist.php'
 params = { 'keyword': '8691', 'charset': 'utf-8', 'page': 1 }
@@ -696,6 +697,177 @@ def timeout_left_ms(deadline_ts: float, min_ms: int = 1) -> int:
     left = int((deadline_ts - time.monotonic()) * 1000)
     return left if left > min_ms else min_ms
 
+def is_target_closed_error(err) -> bool:
+    msg = str(err).lower()
+    return (
+        ('target page' in msg and 'has been closed' in msg)
+        or ('context or browser has been closed' in msg)
+        or ('target closed' in msg)
+    )
+
+def normalize_candidate_url(raw: str, base_url: str):
+    if not raw:
+        return None
+    u = html_lib.unescape(str(raw).strip().strip('\'"'))
+    if not u:
+        return None
+    u = u.replace('\\/', '/').replace('\\u002F', '/')
+    if u.startswith('//'):
+        u = 'https:' + u
+    if u.startswith('/'):
+        u = urljoin(base_url, u)
+    elif u.startswith('?'):
+        u = f'{base_url.rstrip("/")}{u}'
+    if not (u.startswith('http://') or u.startswith('https://')):
+        return None
+    return u
+
+def is_download_candidate_url(url: str) -> bool:
+    l = url.lower()
+    blocked_suffix = ('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.map')
+    if any(l.endswith(x) for x in blocked_suffix):
+        return False
+    signals = (
+        '.zip', '.7z', '.rar',
+        '/file/?', 'developer-oss.lanrar.com/file',
+        '/down', '/download', '/fn?',
+        'token=', 'sign='
+    )
+    return any(s in l for s in signals)
+
+def extract_candidate_urls_from_text(text: str, base_url: str):
+    urls = []
+    if not text:
+        return urls
+    patterns = [
+        r'https?://[^\s"\'<>\\]+',
+        r'(?i)(?:url|link|downloadurl|downurl)\s*[:=]\s*["\']([^"\']+)["\']',
+        r'(?i)href\s*=\s*["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            raw = m.group(1) if m.groups() else m.group(0)
+            u = normalize_candidate_url(raw, base_url)
+            if u and is_download_candidate_url(u):
+                urls.append(u)
+    return urls
+
+def collect_page_download_candidates(page):
+    candidates = []
+    try:
+        scopes = all_scopes(page)
+    except Exception:
+        return candidates
+    for scope in scopes:
+        base = page.url
+        try:
+            if hasattr(scope, 'url') and scope.url:
+                base = scope.url
+        except Exception:
+            pass
+        try:
+            txt = scope.content()
+            candidates.extend(extract_candidate_urls_from_text(txt, base))
+        except Exception:
+            continue
+        try:
+            anchors = scope.locator('a[href]')
+            count = min(anchors.count(), 200)
+            for i in range(count):
+                href = anchors.nth(i).get_attribute('href')
+                u = normalize_candidate_url(href, base)
+                if u and is_download_candidate_url(u):
+                    candidates.append(u)
+        except Exception:
+            pass
+    # deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for u in candidates:
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+    return uniq
+
+def infer_ext_from_response(resp, fallback: str = '.zip') -> str:
+    cd = (resp.headers.get('content-disposition', '') or '').strip()
+    if cd:
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+        if m:
+            fn = unquote(m.group(1).strip().strip('"'))
+            ext = os.path.splitext(fn)[1]
+            if ext:
+                return ext
+    path = unquote(urlparse(resp.url).path)
+    ext = os.path.splitext(path)[1]
+    if ext and len(ext) <= 8:
+        return ext
+    ctype = (resp.headers.get('content-type', '') or '').lower()
+    if '7z' in ctype:
+        return '.7z'
+    if 'rar' in ctype:
+        return '.rar'
+    if 'zip' in ctype:
+        return '.zip'
+    return fallback
+
+def download_from_candidate_urls(candidates, download_dir: str, title: str, referer: str, timeout_ms: int):
+    if not candidates:
+        return None
+    queue = list(candidates[:30])
+    seen = set()
+    timeout_s = max(10, int(timeout_ms / 1000))
+    while queue:
+        u = queue.pop(0)
+        if u in seen:
+            continue
+        seen.add(u)
+        try:
+            resp = session.get(
+                u,
+                headers={'User-Agent': random.choice(user_agents), 'Referer': referer},
+                timeout=timeout_s,
+                allow_redirects=True,
+                stream=True,
+            )
+        except Exception:
+            continue
+        try:
+            if resp.status_code >= 400:
+                continue
+            ctype = (resp.headers.get('content-type', '') or '').lower()
+            is_html_like = ('text/html' in ctype) or ('application/json' in ctype and 'attachment' not in (resp.headers.get('content-disposition', '') or '').lower())
+            if is_html_like:
+                body = resp.text[:300000]
+                nested = extract_candidate_urls_from_text(body, resp.url)
+                for nu in nested:
+                    if nu not in seen:
+                        queue.append(nu)
+                continue
+
+            ext = infer_ext_from_response(resp, fallback='.zip')
+            target = unique_path(download_dir, f'{safe_filename(title)}{ext}')
+            size = 0
+            with open(target, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    size += len(chunk)
+            if size > 0:
+                return target
+            try:
+                os.remove(target)
+            except Exception:
+                pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    return None
+
 def fill_lanzou_password(page, pwd: str):
     if not pwd:
         print('[WARN] Empty lanzou password for this entry, skip password fill.')
@@ -918,6 +1090,7 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str,
     page.set_default_timeout(min(timeout_ms, 15000))
     page.goto(url, wait_until='domcontentloaded', timeout=min(timeout_left_ms(deadline_ts), 45000))
     print('[INFO] Lanzou page opened.')
+    candidate_urls = collect_page_download_candidates(page)
     fill_lanzou_password(page, pwd)
     bundle_page = select_bundle_file_page(page, min(timeout_left_ms(deadline_ts), 20000))
     if bundle_page is None and pwd:
@@ -927,12 +1100,41 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str,
     if bundle_page is None:
         return None, 'no_bundle'
     print('[INFO] Lanzou bundle page found.')
+    candidate_urls.extend(collect_page_download_candidates(bundle_page))
     if timeout_left_ms(deadline_ts) <= 1:
         return None, 'timeout'
     normal_page, download = open_normal_download_page(bundle_page, deadline_ts)
+    candidate_urls.extend(collect_page_download_candidates(normal_page))
     if download is None:
         print('[INFO] Lanzou resolving verify/download flow.')
-        download = resolve_verify_and_download(normal_page, deadline_ts)
+        target_closed = False
+        try:
+            download = resolve_verify_and_download(normal_page, deadline_ts)
+        except Exception as e:
+            if is_target_closed_error(e):
+                target_closed = True
+                print('[WARN] Lanzou page/context closed during verify flow, try direct-link fallback.')
+                download = None
+            else:
+                raise
+        if download is None:
+            referer_url = url
+            try:
+                referer_url = normal_page.url
+            except Exception:
+                pass
+            direct_out = download_from_candidate_urls(
+                candidate_urls,
+                download_dir=download_dir,
+                title=title,
+                referer=referer_url,
+                timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+            )
+            if direct_out:
+                print('[INFO] Lanzou direct-link fallback download succeeded.')
+                return direct_out, 'ok'
+            if target_closed:
+                return None, 'target_closed'
     if download is None:
         if timeout_left_ms(deadline_ts) <= 1:
             return None, 'timeout'
@@ -1078,6 +1280,12 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
                         out2, status2 = download_one_lanzou(steel_page, url, pwd, download_dir, title, timeout_ms)
                         if status2 == 'ok' and out2:
                             out, status = out2, status2
+                            break
+                        status = status2
+                        if status2 == 'target_closed' and attempt < 1:
+                            close_steel_fallback()
+                            print('[INFO] Steel fallback target closed, recreating and retrying.')
+                            continue
                         break
                     except Exception as e:
                         err = str(e).lower()
