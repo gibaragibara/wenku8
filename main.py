@@ -112,7 +112,11 @@ def init_steel():
     from dotenv import dotenv_values
     from playwright.sync_api import sync_playwright
     global browser, playwright_ctx_cookie_dict, steel_dict
-    steel_api_key = dotenv_values().get('STEEL_API_KEY', '')
+    steel_api_key = os.getenv('STEEL_API_KEY', '').strip()
+    if not steel_api_key:
+        steel_api_key = dotenv_values().get('STEEL_API_KEY', '').strip()
+    if not steel_api_key:
+        raise RuntimeError('[ERROR] STEEL_API_KEY is empty. Set env STEEL_API_KEY or provide .env in /app.')
     client = Steel(steel_api_key=steel_api_key)
     steel_session = client.sessions.create(api_timeout=20000)
     print(f'[INFO] Running Steel session: {steel_session.id}')
