@@ -109,10 +109,7 @@ cp docker-compose.yml.example docker-compose.yml
 docker compose --env-file .env up -d
 ```
 
-访问页面：
-
-- 本机：`http://localhost:8080/index.html`
-- VPS：`http://<你的VPS公网IP>:8080/index.html`
+静态页面会输出到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。
 
 ## GitHub DockerHub CI
 
