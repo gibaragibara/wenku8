@@ -53,11 +53,14 @@ STEEL_API_KEY=...
 
 ---
 
-此外，在 wenku8 某次更新后，还需要登录网站来访问论坛内容。为此，你需要在浏览器中登录后，将 `COOKIE` 文件保存到项目根目录。`COOKIE` 的开头如下所示：
+此外，在 wenku8 某次更新后，还需要登录网站来访问论坛内容。可通过以下两种方式提供 Cookie（优先读取 `COOKIE` 文件，否则读取环境变量 `WENKU_COOKIES`）：
 
 ```
 jieqiUserCharset=utf-8; jieqiVisitId=...; ...
 ```
+
+- 文件方式：项目根目录创建 `COOKIE` 文件，第一行写入整行 Cookie
+- 环境变量方式：设置 `WENKU_COOKIES` 为整行 Cookie
 
 ## Workflow
 
@@ -78,7 +81,45 @@ jieqiUserCharset=utf-8; jieqiVisitId=...; ...
 - `create_html_merged(), create_html_epub()` 生成 HTML 文件
     - 输出：`public/index.html`, `public/epub.html`
 
+运行 `main.py` 时会在生成页面后自动下载本次更新条目里的蓝奏“合集”压缩包（`.zip/.7z/.rar`）：
+
+```bash
+python main.py playwright
+```
+
+下载目录默认是 `out/downloads`，文件会自动重命名为“书名 + 扩展名”。
+
 此外，GitHub Actions 会每天自动运行 `main.py`，将 `public/` 目录提交到 `gh-pages` 分支并部署到 GitHub Pages。
+
+## Docker (VPS)
+
+项目已提供：
+
+- `Dockerfile`
+- `docker-compose.yml.example`
+- `.env.example`
+
+使用方式：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填写 WENKU_COOKIES
+cp docker-compose.yml.example docker-compose.yml
+# 编辑 docker-compose.yml，把镜像名改成你的 Docker Hub 仓库
+docker compose --env-file .env up -d
+```
+
+## GitHub DockerHub CI
+
+新增工作流 `.github/workflows/dockerhub.yml`：
+
+- 每次 push / PR 先做 Python 编译检查（`py_compile`）
+- push 到 `main` 且编译通过后，自动构建并推送 Docker 镜像到 Docker Hub
+
+需要在仓库 Secrets 中配置：
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
 
 ## Remarks
 

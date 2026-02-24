@@ -5,3 +5,8 @@ last_success_date.txt
 auto_run.log
 COOKIE
 .env
+__pycache__/
+*.pyc
+.DS_Store
+out/downloads/
+out/testdl/

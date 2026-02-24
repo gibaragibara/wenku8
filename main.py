@@ -5,6 +5,7 @@ import time
 import random
 from urllib.parse import urljoin
 import sys
+import argparse
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import re
@@ -42,6 +43,8 @@ DL_FILE = os.path.join(OUT_DIR, 'dl.txt')
 MERGED_CSV = os.path.join(OUT_DIR, 'merged.csv')
 EPUB_HTML = os.path.join(PUBLIC_DIR, 'epub.html')
 MERGED_HTML = os.path.join(PUBLIC_DIR, 'index.html')
+DOWNLOAD_DIR = os.path.join(OUT_DIR, 'downloads')
+_prefix = ''
 
 retry_strategy = Retry(
     total=5,
@@ -53,6 +56,7 @@ adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 session.headers.update(HEADERS)
+COOKIE_ENV_KEYS = ('WENKU_COOKIES', 'COOKIE')
 
 def parse_cookie_line(line: str):
     line = line.strip()
@@ -67,18 +71,24 @@ def parse_cookie_line(line: str):
         cookie_dict[k.strip()] = v.strip()
     return cookie_dict
 
-def load_cookie_from_file(sess: requests.Session, filepath: str):
-    if not os.path.exists(filepath):
-        return
-    with open(filepath, 'r', encoding='utf-8') as f:
-        # 只取第一行，整行都是 "k1=v1; k2=v2; ..."
-        line = f.readline()
-    cookie_dict = parse_cookie_line(line)
-    if cookie_dict:
-        jar = requests.utils.cookiejar_from_dict(cookie_dict)
-        sess.cookies.update(jar)
+def load_cookie_dict(filepath: str):
+    line = ''
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            # 只取第一行，整行都是 "k1=v1; k2=v2; ..."
+            line = f.readline().strip()
+    if not line:
+        for key in COOKIE_ENV_KEYS:
+            env_line = os.getenv(key, '').strip()
+            if env_line:
+                line = env_line
+                break
+    return parse_cookie_line(line)
 
-load_cookie_from_file(session, COOKIE_FILE)
+COOKIE_DICT = load_cookie_dict(COOKIE_FILE)
+if COOKIE_DICT:
+    jar = requests.utils.cookiejar_from_dict(COOKIE_DICT)
+    session.cookies.update(jar)
 
 browser = None
 playwright_ctx_cookie_dict = None
@@ -93,13 +103,8 @@ def init_playwright():
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox']
         )
-        # 预解析 COOKIE_FILE，供后面 new_context 使用
-        if os.path.exists(COOKIE_FILE):
-            with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
-                line = f.readline()
-            playwright_ctx_cookie_dict = parse_cookie_line(line)
-        else:
-            playwright_ctx_cookie_dict = {}
+        # 预解析 COOKIE，供后面 new_context 使用
+        playwright_ctx_cookie_dict = dict(COOKIE_DICT)
     return browser
 
 def init_steel():
@@ -123,12 +128,7 @@ def init_steel():
             f'wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={steel_session.id}'
         )
 
-        if os.path.exists(COOKIE_FILE):
-            with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
-                line = f.readline()
-            playwright_ctx_cookie_dict = parse_cookie_line(line)
-        else:
-            playwright_ctx_cookie_dict = {}
+        playwright_ctx_cookie_dict = dict(COOKIE_DICT)
     return browser
 
 def exit_steel():
@@ -340,6 +340,7 @@ def scrape():
             lines = lines[:1] + [','.join(entry) + '\n' for entry in all_entries] + lines[1:]
             f.seek(0)
             f.writelines(lines)
+    return all_entries
 
 # ========== Data Processing ==========
 def purify(text: str) -> str: # 只保留中文、英文和数字
@@ -574,19 +575,312 @@ def create_html_epub():
     with open(EPUB_HTML, 'w', encoding='utf-8') as f:
         f.write(html)
 
+def safe_filename(name: str) -> str:
+    safe = re.sub(r'[\\/:*?"<>|]+', '_', name).strip()
+    return safe[:120] if safe else 'untitled'
+
+def unique_path(base_dir: str, filename: str) -> str:
+    root, ext = os.path.splitext(filename)
+    out = os.path.join(base_dir, filename)
+    i = 1
+    while os.path.exists(out):
+        out = os.path.join(base_dir, f'{root}_{i}{ext}')
+        i += 1
+    return out
+
+def first_locator(scope, selectors):
+    for sel in selectors:
+        loc = scope.locator(sel)
+        if loc.count() > 0:
+            return loc.first
+    return None
+
+def all_scopes(page):
+    scopes = [page]
+    for fr in page.frames:
+        if fr != page.main_frame:
+            scopes.append(fr)
+    return scopes
+
+def first_locator_any_scope(page, selectors):
+    for scope in all_scopes(page):
+        loc = first_locator(scope, selectors)
+        if loc is not None:
+            return loc
+    return None
+
+def fill_lanzou_password(page, pwd: str):
+    if not pwd:
+        return
+    pwd_loc = first_locator_any_scope(page, [
+        '#pwd',
+        'input[name="pwd"]',
+        'input[type="password"]',
+        'input[id*="pwd"]',
+        'text=输入密码',
+    ])
+    if pwd_loc is None:
+        return
+    pwd_loc.fill(pwd)
+    submit_loc = first_locator_any_scope(page, [
+        '#sub',
+        'button:has-text("确定")',
+        'button:has-text("提取")',
+        'input[type="submit"]',
+        'input[type="button"]',
+        'text=确定',
+        'text=提取',
+    ])
+    if submit_loc is not None:
+        submit_loc.click()
+    else:
+        pwd_loc.press('Enter')
+    page.wait_for_timeout(1200)
+
+def click_and_follow(page, node, timeout_ms: int):
+    context = page.context
+    known = set(context.pages)
+    try:
+        with context.expect_page(timeout=min(timeout_ms, 5000)) as new_page_info:
+            node.click(force=True)
+        new_page = new_page_info.value
+        new_page.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
+        return new_page
+    except Exception:
+        try:
+            node.click(force=True)
+        except Exception:
+            return page
+        page.wait_for_timeout(800)
+        for p in context.pages:
+            if p not in known:
+                p.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
+                return p
+        return page
+
+def try_click_download(page, node, timeout_ms: int):
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    try:
+        with page.expect_download(timeout=timeout_ms) as dl_info:
+            node.click(force=True)
+        return dl_info.value
+    except PlaywrightTimeoutError:
+        return None
+    except Exception:
+        return None
+
+def select_bundle_file_page(page, timeout_ms: int):
+    for scope in all_scopes(page):
+        anchors = scope.locator('a')
+        count = min(anchors.count(), 300)
+        bundle_candidates = []
+        for i in range(count):
+            node = anchors.nth(i)
+            try:
+                txt = node.inner_text(timeout=600).strip()
+            except Exception:
+                continue
+            txt_l = txt.lower()
+            if '合集' not in txt:
+                continue
+            if not any(ext in txt_l for ext in ['.zip', '.7z', '.rar']):
+                continue
+            bundle_candidates.append(node)
+        if bundle_candidates:
+            return click_and_follow(page, bundle_candidates[0], timeout_ms)
+    return None
+
+def open_normal_download_page(page, timeout_ms: int):
+    normal_loc = first_locator_any_scope(page, [
+        'a:has-text("普通下载")',
+        'button:has-text("普通下载")',
+        'input[value="普通下载"]',
+        'a#tourl',
+        'text=普通下载',
+    ])
+    if normal_loc is None:
+        return page, None
+    direct_download = try_click_download(page, normal_loc, timeout_ms=min(timeout_ms, 12000))
+    if direct_download is not None:
+        return page, direct_download
+    return click_and_follow(page, normal_loc, timeout_ms), None
+
+def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
+    if depth > 2:
+        return None
+    verify_loc = first_locator_any_scope(page, [
+        'button:has-text("验证并下载")',
+        'a:has-text("验证并下载")',
+        'input[value="验证并下载"]',
+        'text=验证并下载',
+    ])
+    if verify_loc is not None:
+        try:
+            verify_loc.click(force=True)
+            page.wait_for_timeout(2200)
+        except Exception:
+            pass
+
+    for _ in range(4):
+        for sel in [
+            'button:has-text("即刻下载")',
+            'button:has-text("立即下载")',
+            'a:has-text("即刻下载")',
+            'a:has-text("立即下载")',
+            'button:has-text("普通下载")',
+            'a:has-text("普通下载")',
+            'a#tourl',
+            'button:has-text("下载")',
+            'a:has-text("下载")',
+            'a[href*="down"]',
+            'a[href*="file"]',
+            'text=即刻下载',
+            'text=立即下载',
+        ]:
+            for scope in all_scopes(page):
+                loc = scope.locator(sel)
+                if loc.count() == 0:
+                    continue
+                node = loc.first
+                try:
+                    if hasattr(node, 'is_enabled') and (not node.is_enabled()):
+                        continue
+                except Exception:
+                    pass
+                download = try_click_download(page, node, timeout_ms=min(timeout_ms, 15000))
+                if download is not None:
+                    return download
+                try:
+                    nxt = click_and_follow(page, node, timeout_ms=min(timeout_ms, 10000))
+                    if nxt != page:
+                        nested = resolve_verify_and_download(nxt, timeout_ms, depth + 1)
+                        if nested is not None:
+                            return nested
+                except Exception:
+                    continue
+        page.wait_for_timeout(1500)
+    return None
+
+def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str, timeout_ms: int):
+    page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
+    fill_lanzou_password(page, pwd)
+    bundle_page = select_bundle_file_page(page, timeout_ms)
+    if bundle_page is None:
+        return None, 'no_bundle'
+    normal_page, download = open_normal_download_page(bundle_page, timeout_ms)
+    if download is None:
+        download = resolve_verify_and_download(normal_page, timeout_ms)
+    if download is None:
+        return None, 'no_download'
+    suggested = download.suggested_filename or 'bundle.zip'
+    ext = os.path.splitext(suggested)[1].strip()
+    if not ext:
+        ext = '.zip'
+    target_name = f'{safe_filename(title)}{ext}'
+    target = unique_path(download_dir, target_name)
+    download.save_as(target)
+    return target, 'ok'
+
+def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeout_ms: int = 30000, headless: bool = True):
+    if not os.path.exists(MERGED_CSV):
+        print(f'[WARN] MERGED_CSV not found: {MERGED_CSV}')
+        return
+    prefix = _prefix.strip().replace('https://', '').replace('http://', '').rstrip('/')
+    if not prefix:
+        print('[WARN] Empty lanzou prefix, skip downloading.')
+        return
+
+    df = pd.read_csv(MERGED_CSV, encoding='utf-8-sig')
+    if new_entries:
+        links = {entry[3] for entry in new_entries if len(entry) > 3}
+        if links:
+            df = df[df['novel_link'].isin(links)]
+    df = df[df['dl_label'].notna()].copy()
+    if df.empty:
+        print('[INFO] No lanzou entries to download.')
+        return
+    df['dl_label'] = df['dl_label'].astype(str).str.strip()
+    df = df[df['dl_label'] != '']
+    if limit > 0:
+        df = df.head(limit)
+    if df.empty:
+        print('[INFO] No lanzou entries to download after filtering.')
+        return
+
+    os.makedirs(download_dir, exist_ok=True)
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        print(f'[ERROR] Playwright is required for lanzou auto download: {e}')
+        return
+
+    ok_cnt = 0
+    fail_cnt = 0
+    skip_cnt = 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
+        for row in df.itertuples():
+            label = str(row.dl_label).strip()
+            pwd = '' if pd.isna(row.dl_pwd) else str(row.dl_pwd).strip()
+            title = row.main if (hasattr(row, 'main') and isinstance(row.main, str) and row.main) else f'{label}'
+            url = f'https://{prefix}/{label}'
+            print(f'[INFO] downloading: {title} ({url})')
+            try:
+                out, status = download_one_lanzou(page, url, pwd, download_dir, title, timeout_ms)
+                if status == 'ok' and out:
+                    ok_cnt += 1
+                    print(f'[INFO] saved: {out}')
+                elif status == 'no_bundle':
+                    skip_cnt += 1
+                    print(f'[INFO] skip (no 合集 file): {url}')
+                else:
+                    fail_cnt += 1
+                    print(f'[WARN] no downloadable link found: {url}')
+            except Exception as e:
+                fail_cnt += 1
+                print(f'[WARN] failed to download {url}: {e}')
+        context.close()
+        browser.close()
+
+    print(f'[INFO] lanzou download done, success={ok_cnt}, skipped={skip_cnt}, failed={fail_cnt}, dir={download_dir}')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='wenku8 scraper and site generator')
+    parser.add_argument(
+        'scraper',
+        nargs='?',
+        default='steel',
+        choices=['requests', 'playwright', 'steel'],
+        help='scraper backend'
+    )
+    return parser.parse_args()
+
 def main():
     if not os.path.exists(OUT_DIR):
         os.mkdir(OUT_DIR)
     if not os.path.exists(PUBLIC_DIR):
         os.mkdir(PUBLIC_DIR)
     
-    scrape()
+    new_entries = scrape()
     merge()
     create_html_merged()
     create_html_epub()
+    # 默认自动下载本次更新中的“合集”压缩包
+    download_lanzou_files(
+        new_entries,
+        DOWNLOAD_DIR,
+        limit=0,
+        timeout_ms=90000,
+        headless=True,
+    )
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1:
-        _scraper = sys.argv[1]
-        print(f'[INFO] Using scraper: {_scraper}')
+    args = parse_args()
+    _scraper = args.scraper
+    print(f'[INFO] Using scraper: {_scraper}')
     main()

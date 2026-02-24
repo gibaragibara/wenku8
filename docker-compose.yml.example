@@ -1,0 +1,15 @@
+services:
+  wenku8:
+    image: your-dockerhub-username/wenku8:latest
+    container_name: wenku8
+    environment:
+      # 必填：wenku8 登录后的整行 Cookie
+      WENKU_COOKIES: ${WENKU_COOKIES}
+      # 可选：仅在使用 steel 模式时需要
+      STEEL_API_KEY: ${STEEL_API_KEY:-}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./out:/app/out
+      - ./docs:/app/docs
+    command: ["python", "main.py", "playwright"]
+    restart: "no"
