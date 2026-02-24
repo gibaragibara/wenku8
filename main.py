@@ -362,15 +362,16 @@ def parse_page(page_num: int, latest_post_link: str = None):
 def scrape():
     # 获取POST_LIST_FILE中第一个post_link
     latest_post_link = None
+    has_history = False
     try:
         with open(POST_LIST_FILE, 'r', encoding='utf-8') as f:
-            next(f)  # skip header
+            next(f, None)  # skip header
             first_line = next(f, '').strip()
             if first_line:
                 latest_post_link = first_line.split(',')[1]
-            file_exists = True
+                has_history = True
     except FileNotFoundError:
-        file_exists = False
+        has_history = False
 
     all_entries = []
     stop = False
@@ -405,7 +406,7 @@ def scrape():
     #     f.write('post_title,post_link,novel_title,novel_link\n')
     #     for entry in all_entries:
     #         f.write(','.join(entry) + '\n')
-    if not file_exists:
+    if not has_history:
         with open(POST_LIST_FILE, 'w', encoding='utf-8', newline='') as f:
             f.write('post_title,post_link,novel_title,novel_link\n')
             for entry in all_entries:
@@ -417,7 +418,7 @@ def scrape():
             lines = lines[:1] + [','.join(entry) + '\n' for entry in all_entries] + lines[1:]
             f.seek(0)
             f.writelines(lines)
-    return all_entries, file_exists
+    return all_entries, has_history
 
 # ========== Data Processing ==========
 def purify(text: str) -> str: # 只保留中文、英文和数字
@@ -686,6 +687,10 @@ def first_locator_any_scope(page, selectors):
             return loc
     return None
 
+def timeout_left_ms(deadline_ts: float, min_ms: int = 1) -> int:
+    left = int((deadline_ts - time.monotonic()) * 1000)
+    return left if left > min_ms else min_ms
+
 def fill_lanzou_password(page, pwd: str):
     if not pwd:
         print('[WARN] Empty lanzou password for this entry, skip password fill.')
@@ -735,11 +740,12 @@ def fill_lanzou_password(page, pwd: str):
 def click_and_follow(page, node, timeout_ms: int):
     context = page.context
     known = set(context.pages)
+    load_timeout = max(3000, min(timeout_ms, 15000))
     try:
         with context.expect_page(timeout=min(timeout_ms, 5000)) as new_page_info:
             node.click(force=True)
         new_page = new_page_info.value
-        new_page.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
+        new_page.wait_for_load_state('domcontentloaded', timeout=load_timeout)
         return new_page
     except Exception:
         try:
@@ -749,7 +755,7 @@ def click_and_follow(page, node, timeout_ms: int):
         page.wait_for_timeout(800)
         for p in context.pages:
             if p not in known:
-                p.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
+                p.wait_for_load_state('domcontentloaded', timeout=load_timeout)
                 return p
         return page
 
@@ -765,14 +771,23 @@ def try_click_download(page, node, timeout_ms: int):
         return None
 
 def select_bundle_file_page(page, timeout_ms: int):
+    quick_bundle = first_locator_any_scope(page, [
+        'a:has-text("合集.zip")',
+        'a:has-text("合集.7z")',
+        'a:has-text("合集.rar")',
+        'a:has-text("合集")',
+    ])
+    if quick_bundle is not None:
+        return click_and_follow(page, quick_bundle, timeout_ms)
+
     for scope in all_scopes(page):
         anchors = scope.locator('a')
-        count = min(anchors.count(), 300)
+        count = min(anchors.count(), 120)
         bundle_candidates = []
         for i in range(count):
             node = anchors.nth(i)
             try:
-                txt = node.inner_text(timeout=600).strip()
+                txt = node.inner_text(timeout=250).strip()
             except Exception:
                 continue
             txt_l = txt.lower()
@@ -857,19 +872,27 @@ def resolve_verify_and_download(page, timeout_ms: int, depth: int = 0):
     return None
 
 def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str, timeout_ms: int):
-    page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
+    deadline_ts = time.monotonic() + (max(timeout_ms, 10000) / 1000.0)
+    page.set_default_timeout(min(timeout_ms, 15000))
+    page.goto(url, wait_until='domcontentloaded', timeout=min(timeout_left_ms(deadline_ts), 45000))
+    print('[INFO] Lanzou page opened.')
     fill_lanzou_password(page, pwd)
-    bundle_page = select_bundle_file_page(page, timeout_ms)
+    bundle_page = select_bundle_file_page(page, min(timeout_left_ms(deadline_ts), 20000))
     if bundle_page is None and pwd:
         # 密码页/iframe 异步加载时再尝试一次
         fill_lanzou_password(page, pwd)
-        bundle_page = select_bundle_file_page(page, timeout_ms)
+        bundle_page = select_bundle_file_page(page, min(timeout_left_ms(deadline_ts), 20000))
     if bundle_page is None:
         return None, 'no_bundle'
-    normal_page, download = open_normal_download_page(bundle_page, timeout_ms)
+    print('[INFO] Lanzou bundle page found.')
+    if timeout_left_ms(deadline_ts) <= 1:
+        return None, 'timeout'
+    normal_page, download = open_normal_download_page(bundle_page, min(timeout_left_ms(deadline_ts), 20000))
     if download is None:
-        download = resolve_verify_and_download(normal_page, timeout_ms)
+        download = resolve_verify_and_download(normal_page, min(timeout_left_ms(deadline_ts), 25000))
     if download is None:
+        if timeout_left_ms(deadline_ts) <= 1:
+            return None, 'timeout'
         return None, 'no_download'
     suggested = download.suggested_filename or 'bundle.zip'
     ext = os.path.splitext(suggested)[1].strip()
@@ -922,13 +945,13 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
             args=['--no-sandbox', '--disable-setuid-sandbox']
         )
         context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
         for row in df.itertuples():
             label = str(row.dl_label).strip()
             pwd = '' if pd.isna(row.dl_pwd) else str(row.dl_pwd).strip()
             title = row.main if (hasattr(row, 'main') and isinstance(row.main, str) and row.main) else f'{label}'
             url = f'https://{prefix}/{label}'
             print(f'[INFO] downloading: {title} ({url})')
+            page = context.new_page()
             try:
                 out, status = download_one_lanzou(page, url, pwd, download_dir, title, timeout_ms)
                 if status == 'ok' and out:
@@ -937,12 +960,20 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
                 elif status == 'no_bundle':
                     skip_cnt += 1
                     print(f'[INFO] skip (no 合集 file): {url}')
+                elif status == 'timeout':
+                    fail_cnt += 1
+                    print(f'[WARN] lanzou download timeout: {url}')
                 else:
                     fail_cnt += 1
                     print(f'[WARN] no downloadable link found: {url}')
             except Exception as e:
                 fail_cnt += 1
                 print(f'[WARN] failed to download {url}: {e}')
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
         context.close()
         browser.close()
 
