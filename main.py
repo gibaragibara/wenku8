@@ -150,7 +150,7 @@ def init_steel():
     if not steel_api_key:
         raise RuntimeError('[ERROR] STEEL_API_KEY is empty. Set env STEEL_API_KEY or provide .env in /app.')
     client = Steel(steel_api_key=steel_api_key)
-    steel_session = client.sessions.create(api_timeout=20000)
+    steel_session = client.sessions.create(api_timeout=40000)
     print(f'[INFO] Running Steel session: {steel_session.id}')
     steel_dict = {
         'api_key': steel_api_key,
