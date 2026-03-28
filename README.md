@@ -81,7 +81,13 @@ jieqiUserCharset=utf-8; jieqiVisitId=...; ...
 - `create_html_merged(), create_html_epub()` 生成 HTML 文件
     - 输出：`docs/index.html`, `docs/epub.html`
 
-运行 `main.py` 时会在生成页面后自动下载本次更新条目里的蓝奏“合集”压缩包（`.zip/.7z/.rar`）。
+运行 `main.py` 时会在生成页面后自动处理蓝奏源 EPUB：
+
+- 首次部署时自动建立基线，不回补历史库存
+- 之后每次有新条目进入 `merged.csv` 时，自动下载对应蓝奏资源
+- 优先下载简体“合集.zip/.7z/.rar”，没有合集时回退到单卷 EPUB
+- 自动提取 EPUB 到本地目录，并过滤 `zht_` / “繁体”文件
+
 可通过环境变量关闭该功能：
 
 ```bash
@@ -94,7 +100,11 @@ ENABLE_LANZOU_DOWNLOAD=false python main.py playwright
 python main.py playwright
 ```
 
-下载目录默认是 `out/downloads`，文件会自动重命名为“书名 + 扩展名”。
+下载输出默认在 `out/downloads/`：
+
+- `out/downloads/archives/`：蓝奏归档文件
+- `out/downloads/epubs/`：提取后的简体 EPUB
+- `out/downloads/state.json`：基线与已处理状态
 
 此外，GitHub Actions 会每天自动运行抓取流程，并将 `docs/` 目录部署到 GitHub Pages。
 
@@ -120,9 +130,9 @@ docker compose --env-file .env up -d
 
 - 容器常驻运行
 - 每 `RUN_INTERVAL_SECONDS` 秒执行一次：`txt.py` + `main.py $SCRAPER`
-- `ENABLE_LANZOU_DOWNLOAD=true` 时，有新内容会自动下载蓝奏“合集”压缩包并重命名
+- `ENABLE_LANZOU_DOWNLOAD=true` 时，有新内容会自动下载并提取蓝奏 EPUB
 - `ENABLE_LANZOU_DOWNLOAD=false` 时，只抓取与生成页面，不执行蓝奏下载
-- 首次初始化（无 `out/post_list.csv`）仅尝试下载最新 1 条用于测试，不会扫历史库存
+- 首次初始化时只建立下载基线，不会扫历史库存
 
 静态页面会持续更新到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。
 

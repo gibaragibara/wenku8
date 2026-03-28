@@ -15,6 +15,7 @@ from pathlib import Path
 import pandas as pd
 import sys
 import html as html_lib
+from types import SimpleNamespace
 
 BASE_URL = 'https://www.wenku8.net/modules/article/reviewslist.php'
 params = { 'keyword': '8691', 'charset': 'utf-8', 'page': 1 }
@@ -1241,173 +1242,45 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
     if not os.path.exists(MERGED_CSV):
         print(f'[WARN] MERGED_CSV not found: {MERGED_CSV}')
         return
-    prefix = _prefix.strip().replace('https://', '').replace('http://', '').rstrip('/')
-    if not prefix:
-        print('[WARN] Empty lanzou prefix, skip downloading.')
+    if not os.path.exists(DL_FILE):
+        print(f'[WARN] DL_FILE not found: {DL_FILE}')
         return
-
-    df = pd.read_csv(MERGED_CSV, encoding='utf-8-sig')
-    if new_entries:
-        links = {entry[3] for entry in new_entries if len(entry) > 3}
-        if links:
-            df = df[df['novel_link'].isin(links)]
-    df = df[df['dl_label'].notna()].copy()
-    if df.empty:
-        print('[INFO] No lanzou entries to download.')
-        return
-    df['dl_label'] = df['dl_label'].astype(str).str.strip()
-    df = df[df['dl_label'] != '']
-    if limit > 0:
-        df = df.head(limit)
-    if df.empty:
-        print('[INFO] No lanzou entries to download after filtering.')
-        return
-
-    os.makedirs(download_dir, exist_ok=True)
     try:
-        from playwright.sync_api import sync_playwright
+        from lanzou_epub_downloader import downloader as lanzou_downloader
     except Exception as e:
-        print(f'[ERROR] Playwright is required for lanzou auto download: {e}')
+        print(f'[ERROR] Failed to import integrated lanzou downloader: {e}')
         return
 
-    ok_cnt = 0
-    fail_cnt = 0
-    skip_cnt = 0
-    steel_ctx = None
-    steel_browser = None
-    steel_client = None
-    steel_session_id = ''
-    steel_unavailable = False
+    output_dir = os.getenv('LZ_OUTPUT_DIR', download_dir).strip() or download_dir
+    timeout_ms = read_int_env('LZ_TIMEOUT_MS', timeout_ms)
+    show_browser = read_bool_env('LZ_SHOW_BROWSER', not headless)
+    include_existing = read_bool_env('LZ_INCLUDE_EXISTING', False)
+    force = read_bool_env('LZ_FORCE', False)
+    limit = read_int_env('LZ_LIMIT', limit)
+    name_contains = os.getenv('LZ_NAME_CONTAINS', '').strip()
 
-    def close_steel_fallback():
-        nonlocal steel_ctx, steel_browser, steel_client, steel_session_id
-        if steel_ctx is not None:
-            try:
-                steel_ctx.close()
-            except Exception:
-                pass
-        steel_ctx = None
-        if steel_browser is not None:
-            try:
-                steel_browser.close()
-            except Exception:
-                pass
-        steel_browser = None
-        if steel_client is not None and steel_session_id:
-            try:
-                steel_client.sessions.release(steel_session_id)
-            except Exception:
-                pass
-        steel_client = None
-        steel_session_id = ''
-
-    def ensure_steel_context(p, force_recreate: bool = False):
-        nonlocal steel_ctx, steel_browser, steel_client, steel_session_id, steel_unavailable
-        if force_recreate:
-            close_steel_fallback()
-        if steel_ctx is not None:
-            return steel_ctx
-        if steel_unavailable:
-            return None
-        steel_api_key = get_steel_api_key()
-        if not steel_api_key:
-            steel_unavailable = True
-            print('[WARN] STEEL_API_KEY is empty, skip Steel fallback for lanzou download.')
-            return None
-        try:
-            from steel import Steel
-            steel_client = Steel(steel_api_key=steel_api_key)
-            steel_session = steel_client.sessions.create(api_timeout=20000)
-            steel_session_id = steel_session.id
-            print(f'[INFO] Running Steel fallback session for lanzou: {steel_session_id}')
-            steel_browser = p.chromium.connect_over_cdp(
-                f'wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={steel_session_id}'
-            )
-            steel_ctx = steel_browser.new_context(accept_downloads=True)
-            return steel_ctx
-        except Exception as e:
-            steel_unavailable = True
-            print(f'[WARN] Failed to init Steel fallback, skip retry: {e}')
-            return None
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=headless,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
-        )
-        context = browser.new_context(accept_downloads=True)
-        for row in df.itertuples():
-            label = str(row.dl_label).strip()
-            pwd = '' if pd.isna(row.dl_pwd) else str(row.dl_pwd).strip()
-            title = row.main if (hasattr(row, 'main') and isinstance(row.main, str) and row.main) else f'{label}'
-            url = f'https://{prefix}/{label}'
-            print(f'[INFO] downloading: {title} ({url})')
-            out = None
-            status = 'no_download'
-
-            page = context.new_page()
-            try:
-                out, status = download_one_lanzou(page, url, pwd, download_dir, title, timeout_ms)
-            except Exception as e:
-                status = 'exception'
-                print(f'[WARN] playwright download failed: {url}: {e}')
-            finally:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-
-            # local playwright failed, retry once with Steel fallback
-            if status != 'ok':
-                print(f'[INFO] local playwright failed ({status}), retry with Steel: {url}')
-                for attempt in range(2):
-                    steel_context = ensure_steel_context(p, force_recreate=(attempt > 0))
-                    if steel_context is None:
-                        break
-                    steel_page = steel_context.new_page()
-                    try:
-                        out2, status2 = download_one_lanzou(steel_page, url, pwd, download_dir, title, timeout_ms)
-                        if status2 == 'ok' and out2:
-                            out, status = out2, status2
-                            break
-                        status = status2
-                        if status2 == 'target_closed' and attempt < 1:
-                            close_steel_fallback()
-                            print('[INFO] Steel fallback target closed, recreating and retrying.')
-                            continue
-                        break
-                    except Exception as e:
-                        err = str(e).lower()
-                        print(f'[WARN] steel fallback failed (attempt {attempt + 1}/2): {url}: {e}')
-                        if ('target page' in err and 'has been closed' in err) or ('target closed' in err):
-                            close_steel_fallback()
-                            if attempt < 1:
-                                print('[INFO] Steel fallback session closed unexpectedly, recreating and retrying.')
-                                continue
-                        break
-                    finally:
-                        try:
-                            steel_page.close()
-                        except Exception:
-                            pass
-
-            if status == 'ok' and out:
-                ok_cnt += 1
-                print(f'[INFO] saved: {out}')
-            elif status == 'no_bundle':
-                skip_cnt += 1
-                print(f'[INFO] skip (no 合集 file): {url}')
-            elif status == 'timeout':
-                fail_cnt += 1
-                print(f'[WARN] lanzou download timeout: {url}')
-            else:
-                fail_cnt += 1
-                print(f'[WARN] no downloadable link found: {url}')
-        context.close()
-        browser.close()
-        close_steel_fallback()
-
-    print(f'[INFO] lanzou download done, success={ok_cnt}, skipped={skip_cnt}, failed={fail_cnt}, dir={download_dir}')
+    os.makedirs(output_dir, exist_ok=True)
+    args = SimpleNamespace(
+        merged_csv=MERGED_CSV,
+        dl_txt=DL_FILE,
+        output_dir=output_dir,
+        limit=limit,
+        name_contains=name_contains,
+        timeout_ms=timeout_ms,
+        show_browser=show_browser,
+        force=force,
+        include_existing=include_existing,
+    )
+    print(
+        '[INFO] running integrated lanzou epub downloader: '
+        f'output_dir={output_dir} include_existing={include_existing} force={force} '
+        f'limit={limit} timeout_ms={timeout_ms}'
+    )
+    rc = lanzou_downloader.run(args)
+    if rc != 0:
+        print('[WARN] integrated lanzou epub downloader finished with non-zero status.')
+    else:
+        print('[INFO] integrated lanzou epub downloader finished successfully.')
 
 def parse_args():
     parser = argparse.ArgumentParser(description='wenku8 scraper and site generator')
@@ -1433,40 +1306,13 @@ def main():
     if not read_bool_env('ENABLE_LANZOU_DOWNLOAD', True):
         print('[INFO] ENABLE_LANZOU_DOWNLOAD=false, skip lanzou auto download.')
         return
-
-    first_bootstrap = not os.path.exists(BOOTSTRAP_MARK_FILE)
-    # 首次部署运行时，仅尝试最新 1 条用于验证下载链路（与 post_list 是否存在无关）。
-    if first_bootstrap:
-        print('[INFO] First bootstrap cycle detected, only download the latest one for smoke test.')
-        download_lanzou_files(
-            new_entries[:1],
-            DOWNLOAD_DIR,
-            limit=1,
-            timeout_ms=90000,
-            headless=True,
-        )
-        try:
-            with open(BOOTSTRAP_MARK_FILE, 'w', encoding='utf-8') as f:
-                f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
-        except Exception as e:
-            print(f'[WARN] failed to write bootstrap marker: {e}')
-    elif has_history:
-        download_lanzou_files(
-            new_entries,
-            DOWNLOAD_DIR,
-            limit=0,
-            timeout_ms=90000,
-            headless=True,
-        )
-    else:
-        print('[INFO] No history detected, only download the latest one for smoke test.')
-        download_lanzou_files(
-            new_entries[:1],
-            DOWNLOAD_DIR,
-            limit=1,
-            timeout_ms=90000,
-            headless=True,
-        )
+    download_lanzou_files(
+        new_entries,
+        DOWNLOAD_DIR,
+        limit=0,
+        timeout_ms=240000,
+        headless=True,
+    )
 
 if __name__ == '__main__':
     args = parse_args()
