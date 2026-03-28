@@ -79,7 +79,7 @@ jieqiUserCharset=utf-8; jieqiVisitId=...; ...
 - `merge()` 合并、去重并与 TXT 源进行匹配
     - 输出：`out/merged.csv`
 - `create_html_merged(), create_html_epub()` 生成 HTML 文件
-    - 输出：`public/index.html`, `public/epub.html`
+    - 输出：`docs/index.html`, `docs/epub.html`
 
 运行 `main.py` 时会在生成页面后自动下载本次更新条目里的蓝奏“合集”压缩包（`.zip/.7z/.rar`）。
 可通过环境变量关闭该功能：
@@ -96,7 +96,7 @@ python main.py playwright
 
 下载目录默认是 `out/downloads`，文件会自动重命名为“书名 + 扩展名”。
 
-此外，GitHub Actions 会每天自动运行 `main.py`，将 `public/` 目录提交到 `gh-pages` 分支并部署到 GitHub Pages。
+此外，GitHub Actions 会每天自动运行抓取流程，并将 `docs/` 目录部署到 GitHub Pages。
 
 ## Docker (VPS)
 
@@ -125,6 +125,30 @@ docker compose --env-file .env up -d
 - 首次初始化（无 `out/post_list.csv`）仅尝试下载最新 1 条用于测试，不会扫历史库存
 
 静态页面会持续更新到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。
+
+## 独立蓝奏 EPUB 下载器
+
+仓库中额外提供了一个独立项目：
+
+```text
+lanzou_epub_downloader/
+```
+
+用途：
+
+- 只消费主项目产出的 `out/merged.csv` 与 `out/dl.txt`
+- 首次部署时只建立基线，不回补历史库存
+- 优先下载简体蓝奏合集；没有合集时回退到单卷 EPUB
+- 自动过滤 `zht_` 和“繁体”命名文件
+
+它适合这种部署方式：
+
+- 主 `wenku8` 容器负责抓列表与生成页面
+- 独立蓝奏下载器负责把蓝奏源 EPUB 真正落到 VPS 本地目录
+
+详细说明见：
+
+- [lanzou_epub_downloader/README.md](lanzou_epub_downloader/README.md)
 
 ## GitHub DockerHub CI
 

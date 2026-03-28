@@ -1,0 +1,16 @@
+services:
+  lanzou-downloader:
+    build: .
+    container_name: lanzou-downloader
+    volumes:
+      - /opt/wenku8/out:/input:ro
+      - /opt/wenku8-lanzou:/data
+    command:
+      - python
+      - downloader.py
+      - --merged-csv
+      - /input/merged.csv
+      - --dl-txt
+      - /input/dl.txt
+      - --output-dir
+      - /data
