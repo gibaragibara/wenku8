@@ -11,6 +11,7 @@ from requests.packages.urllib3.util.retry import Retry
 import re
 import json
 import os
+from pathlib import Path
 import pandas as pd
 import sys
 import html as html_lib
@@ -71,6 +72,15 @@ def read_bool_env(key: str, default: bool) -> bool:
         return False
     return default
 
+def read_int_env(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
 def parse_cookie_line(line: str):
     line = line.strip()
     if not line:
@@ -108,6 +118,51 @@ playwright_ctx_cookie_dict = None
 steel_dict = None
 playwright_driver = None
 
+def patch_playwright_driver_for_steel():
+    """Patch Playwright's CDP bootstrap so Steel sessions skip download setup."""
+    try:
+        import playwright
+        chromium_js = (
+            Path(playwright.__file__).resolve().parent
+            / 'driver'
+            / 'package'
+            / 'lib'
+            / 'server'
+            / 'chromium'
+            / 'chromium.js'
+        )
+        if not chromium_js.exists():
+            print(f'[WARN] Playwright chromium driver file not found, skip Steel patch: {chromium_js}')
+            return
+
+        old = '      const persistent = { noDefaultViewport: true };'
+        new = '      const persistent = { noDefaultViewport: true, acceptDownloads: "internal-browser-default" };'
+        txt = chromium_js.read_text(encoding='utf-8')
+        if new in txt:
+            return
+        if old not in txt:
+            print(f'[WARN] Playwright chromium driver layout changed, skip Steel patch: {chromium_js}')
+            return
+
+        chromium_js.write_text(txt.replace(old, new, 1), encoding='utf-8')
+        print('[INFO] Patched Playwright chromium driver for Steel connect_over_cdp.')
+    except Exception as e:
+        print(f'[WARN] Failed to patch Playwright driver for Steel: {e}')
+
+def build_playwright_cookies():
+    if not playwright_ctx_cookie_dict:
+        return []
+    return [
+        {
+            "name": k,
+            "value": v,
+            "domain": "www.wenku8.net",
+            "path": "/",
+            # 可按需设置 "httpOnly" / "secure" / "sameSite"
+        }
+        for k, v in playwright_ctx_cookie_dict.items()
+    ]
+
 def get_steel_api_key() -> str:
     from dotenv import dotenv_values
     steel_api_key = os.getenv('STEEL_API_KEY', '').strip()
@@ -119,6 +174,8 @@ def get_playwright_driver():
     from playwright.sync_api import sync_playwright
     global playwright_driver
     if playwright_driver is None:
+        if _scraper == 'steel':
+            patch_playwright_driver_for_steel()
         playwright_driver = sync_playwright().start()
     return playwright_driver
 
@@ -149,9 +206,17 @@ def init_steel():
     steel_api_key = get_steel_api_key()
     if not steel_api_key:
         raise RuntimeError('[ERROR] STEEL_API_KEY is empty. Set env STEEL_API_KEY or provide .env in /app.')
+    steel_timeout_ms = read_int_env('STEEL_SESSION_TIMEOUT_MS', 10 * 60 * 1000)
+    steel_use_proxy = read_bool_env('STEEL_USE_PROXY', False)
+    steel_solve_captcha = read_bool_env('STEEL_SOLVE_CAPTCHA', False)
     client = Steel(steel_api_key=steel_api_key)
-    steel_session = client.sessions.create(api_timeout=40000)
-    print(f'[INFO] Running Steel session: {steel_session.id}')
+    steel_session = client.sessions.create(
+        api_timeout=40000,
+        timeout=steel_timeout_ms,
+        use_proxy=steel_use_proxy,
+        solve_captcha=steel_solve_captcha,
+    )
+    print(f'[INFO] Running Steel session: {steel_session.id} timeout={steel_timeout_ms} use_proxy={steel_use_proxy} solve_captcha={steel_solve_captcha}')
     steel_dict = {
         'api_key': steel_api_key,
         'session_id': steel_session.id,
@@ -191,30 +256,32 @@ def scrape_page_playwright(url: str):
     global browser, playwright_ctx_cookie_dict
     last_err = None
     for attempt in range(3):
+        context = None
+        page = None
+        owns_context = False
         try:
             if browser is None:
                 browser = (init_steel() if _scraper == 'steel' else init_playwright())
-            # 每次新建 context，并注入 cookie
-            with browser.new_context() as context:
-                if playwright_ctx_cookie_dict:
-                    cookies = [
-                        {
-                            "name": k,
-                            "value": v,
-                            "domain": "www.wenku8.net",
-                            "path": "/",
-                            # 可按需设置 "httpOnly" / "secure" / "sameSite"
-                        }
-                        for k, v in playwright_ctx_cookie_dict.items()
-                    ]
-                    context.add_cookies(cookies)
-                page = context.new_page()
-                page.goto(url, wait_until='networkidle', timeout=45000)
-                if "/login.php" in page.url:
-                    raise ValueError(f"[ERROR] Playwright 模式被重定向到登录页，可能需要更新 COOKIE 文件: {page.url}")
-                html_content = page.content()
-                page.close()
-                return html_content
+            # Steel 的 CDP 默认 context 已经存在，复用它可以避开下载行为初始化报错。
+            if _scraper == 'steel':
+                if not browser.contexts:
+                    raise RuntimeError('[ERROR] Steel browser has no default context')
+                context = browser.contexts[0]
+            else:
+                context = browser.new_context()
+                owns_context = True
+
+            cookies = build_playwright_cookies()
+            if cookies:
+                context.add_cookies(cookies)
+
+            page = context.new_page()
+            wait_until = 'domcontentloaded' if _scraper == 'steel' else 'networkidle'
+            page.goto(url, wait_until=wait_until, timeout=45000)
+            if "/login.php" in page.url:
+                raise ValueError(f"[ERROR] Playwright 模式被重定向到登录页，可能需要更新 COOKIE 文件: {page.url}")
+            html_content = page.content()
+            return html_content
         except ValueError:
             raise
         except Exception as e:
@@ -226,6 +293,17 @@ def scrape_page_playwright(url: str):
             if attempt < 2:
                 time.sleep(1.5 + attempt)
                 continue
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if owns_context and context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
     raise last_err
 
 def scrape_page_requests(url: str):
