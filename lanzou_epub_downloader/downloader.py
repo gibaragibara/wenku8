@@ -365,6 +365,73 @@ def strip_html_tags(text: str) -> str:
     return value
 
 
+def extract_js_var(text: str, name: str) -> Optional[str]:
+    for pattern in [
+        rf"var\s+{re.escape(name)}\s*=\s*'([^']*)'",
+        rf'var\s+{re.escape(name)}\s*=\s*"([^"]*)"',
+        rf"var\s+{re.escape(name)}\s*=\s*([0-9]+)",
+    ]:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def resolve_js_expr(text: str, expr: str) -> Optional[str]:
+    value = (expr or "").strip().rstrip(",")
+    if not value:
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    if re.fullmatch(r"[0-9]+", value):
+        return value
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        return extract_js_var(text, value)
+    return None
+
+
+def extract_js_field_exprs(text: str, key: str) -> List[str]:
+    patterns = [
+        rf"['\"]{re.escape(key)}['\"]\s*:\s*([^,\n}}]+)",
+        rf"\b{re.escape(key)}\b\s*:\s*([^,\n}}]+)",
+    ]
+    exprs: List[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            expr = (match.group(1) or "").strip()
+            if expr:
+                exprs.append(expr)
+    return exprs
+
+
+def extract_js_field_value(text: str, key: str, prefer_last: bool = False) -> Optional[str]:
+    exprs = extract_js_field_exprs(text, key)
+    if prefer_last:
+        exprs = list(reversed(exprs))
+    for expr in exprs:
+        value = resolve_js_expr(text, expr)
+        if value is not None:
+            return value
+    return None
+
+
+def parse_iframe_src(text: str, base_url: str) -> Optional[str]:
+    match = re.search(r"<iframe[^>]+src=['\"]([^'\"]+)['\"]", text, re.I)
+    if not match:
+        return None
+    return urljoin(base_url, match.group(1))
+
+
+def extract_ajaxm_file_id(text: str) -> Optional[str]:
+    matches = re.findall(r"/ajaxm\.php\?file=(\d+)", text)
+    if not matches:
+        return None
+    for file_id in reversed(matches):
+        if file_id != "1":
+            return file_id
+    return matches[-1]
+
+
 def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional[str]:
     timeout_s = max(10, int(timeout_ms / 1000))
     headers = {
@@ -473,7 +540,10 @@ def download_direct_file_via_api_request(api_request, url: str, download_dir: Pa
     try:
         resp = api_request.get(
             url,
-            headers={"Referer": referer or url},
+            headers={
+                "Referer": referer or url,
+                "User-Agent": random.choice(USER_AGENTS),
+            },
             timeout=timeout_ms,
         )
     except Exception:
@@ -588,25 +658,26 @@ def fetch_share_items_via_ajax(page_url: str, pwd: str, timeout_ms: int) -> List
         except Exception:
             pass
 
-    ajax_rel_match = re.search(r"url\s*:\s*'([^']*filemoreajax\.php\?file=\d+[^']*)'", text)
+    ajax_matches = re.findall(r"url\s*:\s*'([^']*filemoreajax\.php\?file=\d+[^']*)'", text)
+    ajax_rel_match = ajax_matches[-1] if ajax_matches else None
     fid_match = re.search(r"'fid'\s*:\s*'?(\d+)'?", text)
     uid_match = re.search(r"'uid'\s*:\s*'([^']+)'", text)
-    time_match = re.search(r"var\s+ib0jsj\s*=\s*'([^']+)'", text)
-    key_match = re.search(r"var\s+_gyvuc\s*=\s*'([^']+)'", text)
     page_match = re.search(r"pgs\s*=\s*(\d+)", text)
     ls_match = re.search(r"'ls'\s*:\s*'?(\d+)'?", text)
-    if not (ajax_rel_match and fid_match and uid_match and time_match and key_match):
+    time_value = extract_js_field_value(text, "t")
+    key_value = extract_js_field_value(text, "k")
+    if not (ajax_rel_match and fid_match and uid_match and time_value and key_value):
         return []
 
-    ajax_url = urljoin(page_url, ajax_rel_match.group(1))
+    ajax_url = urljoin(page_url, ajax_rel_match)
     payload = {
         "lx": "2",
         "fid": fid_match.group(1),
         "uid": uid_match.group(1),
         "pg": (page_match.group(1) if page_match else "1"),
         "rep": "0",
-        "t": time_match.group(1),
-        "k": key_match.group(1),
+        "t": time_value,
+        "k": key_value,
         "up": "1",
         "ls": (ls_match.group(1) if ls_match else "1"),
         "pwd": pwd or "",
@@ -840,15 +911,12 @@ def pick_share_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if item["kind"] == "bundle" and not is_zht_item(item)
     ]
     plain_bundle_items = sorted(bundle_items, key=item_priority)
-    if plain_bundle_items:
-        return [plain_bundle_items[0]]
-
     epub_items = [
         item
         for item in items
         if item["kind"] == "epub" and not is_zht_item(item)
     ]
-    return sorted(epub_items, key=item_priority)
+    return plain_bundle_items + sorted(epub_items, key=item_priority)
 
 
 def open_share_item_page(context, item: Dict[str, str], timeout_ms: int):
@@ -1011,6 +1079,152 @@ def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0, verify
     return None
 
 
+def resolve_item_candidate_url(item_url: str, referer: str, timeout_ms: int) -> Tuple[Optional[str], Optional[str], str]:
+    timeout_s = max(10, int(timeout_ms / 1000))
+    item_headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": referer or item_url,
+    }
+    try:
+        item_resp = SESSION.get(item_url, headers=item_headers, timeout=timeout_s)
+    except Exception as e:
+        return None, None, f"item_request_error:{e}"
+    try:
+        if item_resp.status_code >= 400:
+            return None, None, f"item_status:{item_resp.status_code}"
+        item_page_url = item_resp.url
+        iframe_url = parse_iframe_src(item_resp.text, item_page_url)
+        if not iframe_url:
+            return None, None, "no_iframe"
+    finally:
+        try:
+            item_resp.close()
+        except Exception:
+            pass
+
+    iframe_headers = {
+        "User-Agent": item_headers["User-Agent"],
+        "Referer": item_page_url,
+    }
+    try:
+        iframe_resp = SESSION.get(iframe_url, headers=iframe_headers, timeout=timeout_s)
+    except Exception as e:
+        return None, None, f"iframe_request_error:{e}"
+    try:
+        if iframe_resp.status_code >= 400:
+            return None, None, f"iframe_status:{iframe_resp.status_code}"
+        iframe_text = iframe_resp.text
+        ajax_file_id = extract_ajaxm_file_id(iframe_text)
+        ajaxdata = extract_js_var(iframe_text, "ajaxdata")
+        wp_sign = extract_js_var(iframe_text, "wp_sign")
+        websign = extract_js_field_value(iframe_text, "websign")
+        kdns = extract_js_var(iframe_text, "kdns") or "1"
+        if not (ajax_file_id and ajaxdata and wp_sign):
+            return None, None, "ajaxm_params_missing"
+        ajax_url = urljoin(iframe_resp.url, f"/ajaxm.php?file={ajax_file_id}")
+    finally:
+        try:
+            iframe_resp.close()
+        except Exception:
+            pass
+
+    payload = {
+        "action": "downprocess",
+        "websignkey": ajaxdata,
+        "signs": ajaxdata,
+        "sign": wp_sign,
+        "websign": websign or "",
+        "kd": kdns,
+        "ves": 1,
+    }
+    ajax_headers = {
+        "User-Agent": item_headers["User-Agent"],
+        "Referer": iframe_url,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        ajax_resp = SESSION.post(ajax_url, headers=ajax_headers, data=payload, timeout=timeout_s)
+    except Exception as e:
+        return None, None, f"ajaxm_request_error:{e}"
+    try:
+        if ajax_resp.status_code >= 400:
+            return None, None, f"ajaxm_status:{ajax_resp.status_code}"
+        data = ajax_resp.json()
+    except Exception as e:
+        return None, None, f"ajaxm_json_error:{e}"
+    finally:
+        try:
+            ajax_resp.close()
+        except Exception:
+            pass
+
+    if str(data.get("zt")) != "1":
+        return None, None, f"ajaxm_zt:{data.get('zt')}"
+    dom = str(data.get("dom") or "").strip().rstrip("/")
+    path = str(data.get("url") or "").strip()
+    if not (dom and path):
+        return None, None, "ajaxm_missing_url"
+    candidate_url = f"{dom}/file/{path.lstrip('/')}"
+    return candidate_url, iframe_url, "ok"
+
+
+def download_item_via_http(context, item: Dict[str, str], share_url: str, download_dir: Path, title: str, timeout_ms: int):
+    candidate_url, candidate_referer, status = resolve_item_candidate_url(
+        item["href"],
+        referer=share_url,
+        timeout_ms=timeout_ms,
+    )
+    if not candidate_url:
+        return None, status
+
+    lanrar_candidates = [candidate_url]
+    if "&toolsdown" not in candidate_url.lower():
+        lanrar_candidates.append(candidate_url + "&toolsdown")
+
+    for lanrar_url in lanrar_candidates:
+        final_url = resolve_lanrar_ajax_url(
+            lanrar_url,
+            referer=candidate_referer or share_url,
+            timeout_ms=timeout_ms,
+        )
+        if not final_url:
+            verify_page = None
+            try:
+                verify_page = context.new_page()
+                verify_page.goto(
+                    lanrar_url,
+                    referer=candidate_referer or share_url,
+                    wait_until="domcontentloaded",
+                    timeout=min(timeout_ms, 45000),
+                )
+                verify_page.wait_for_timeout(1500)
+                final_url = resolve_browser_download_link(
+                    verify_page,
+                    time.monotonic() + (max(min(timeout_ms, 45000), 5000) / 1000.0),
+                )
+            except Exception:
+                final_url = None
+            finally:
+                if verify_page is not None:
+                    try:
+                        verify_page.close()
+                    except Exception:
+                        pass
+        if not final_url:
+            continue
+        downloaded = download_direct_file_via_api_request(
+            context.request,
+            final_url,
+            download_dir=download_dir,
+            title=title,
+            referer=lanrar_url,
+            timeout_ms=timeout_ms,
+        )
+        if downloaded:
+            return downloaded, "ok"
+    return None, "no_download"
+
+
 def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str, timeout_ms: int):
     deadline_ts = time.monotonic() + (max(timeout_ms, 10000) / 1000.0)
     page.set_default_timeout(min(timeout_ms, 15000))
@@ -1031,6 +1245,19 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str
     for item in items:
         if timeout_left_ms(deadline_ts) <= 1:
             return None, "timeout"
+        item_title = item["text"] if item["kind"] == "epub" else title
+        direct_out, direct_status = download_item_via_http(
+            page.context,
+            item=item,
+            share_url=url,
+            download_dir=download_dir,
+            title=item_title,
+            timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+        )
+        if direct_out:
+            return direct_out, "ok"
+        if direct_status and direct_status != "no_download":
+            last_status = direct_status
         try:
             page.goto(
                 item["href"],
@@ -1072,7 +1299,7 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str
                         page.context.request,
                         browser_final_url,
                         download_dir=download_dir,
-                        title=item["text"] if item["kind"] == "epub" else title,
+                        title=item_title,
                         referer=verify_page.url,
                         timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
                     )
@@ -1088,7 +1315,7 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str
             direct_out = download_from_candidate_urls(
                 direct_candidates,
                 download_dir=download_dir,
-                title=item["text"] if item["kind"] == "epub" else title,
+                title=item_title,
                 referer=page.url,
                 timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
             )
