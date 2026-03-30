@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urljoin, urlparse
@@ -87,6 +88,37 @@ def load_all_labels(merged_csv_path: Path) -> List[str]:
     return labels
 
 
+def build_entry_signature(entry: Dict[str, str]) -> str:
+    payload = {
+        "title": (entry.get("title") or "").strip(),
+        "volume": (entry.get("volume") or "").strip(),
+        "update": (entry.get("update") or "").strip(),
+        "remark": (entry.get("remark") or "").strip(),
+        "pwd": (entry.get("pwd") or "").strip(),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def load_all_entry_signatures(merged_csv_path: Path) -> Dict[str, str]:
+    signatures: Dict[str, str] = {}
+    with merged_csv_path.open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            label = (row.get("dl_label") or "").strip()
+            if not label or label in signatures:
+                continue
+            entry = {
+                "title": (row.get("main") or row.get("title") or label).strip(),
+                "volume": (row.get("volume") or "").strip(),
+                "label": label,
+                "pwd": (row.get("dl_pwd") or "").strip(),
+                "update": (row.get("dl_update") or row.get("update") or "").strip(),
+                "remark": (row.get("dl_remark") or "").strip(),
+            }
+            signatures[label] = build_entry_signature(entry)
+    return signatures
+
+
 def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "") -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     needle = name_contains.strip().lower()
@@ -116,17 +148,18 @@ def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "")
 
 def load_state(path: Path) -> Dict[str, dict]:
     if not path.exists():
-        return {"labels": {}, "baseline_labels": [], "baseline_created_at": ""}
+        return {"labels": {}, "baseline_labels": [], "baseline_entries": {}, "baseline_created_at": ""}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("invalid state")
         data.setdefault("labels", {})
         data.setdefault("baseline_labels", [])
+        data.setdefault("baseline_entries", {})
         data.setdefault("baseline_created_at", "")
         return data
     except Exception:
-        return {"labels": {}, "baseline_labels": [], "baseline_created_at": ""}
+        return {"labels": {}, "baseline_labels": [], "baseline_entries": {}, "baseline_created_at": ""}
 
 
 def save_state(path: Path, state: Dict[str, dict]) -> None:
@@ -1391,6 +1424,38 @@ def build_entry_title(entry: Dict[str, str]) -> str:
     return " ".join(parts)
 
 
+def entry_updated_after_baseline(entry: Dict[str, str], baseline_created_at: str) -> bool:
+    update_value = (entry.get("update") or "").strip()
+    if not update_value or not baseline_created_at:
+        return False
+    try:
+        update_day = datetime.strptime(update_value, "%Y-%m-%d").date()
+        baseline_day = datetime.strptime(baseline_created_at, "%Y-%m-%d %H:%M:%S").date()
+    except ValueError:
+        return False
+    return update_day > baseline_day
+
+
+def make_state_entry(
+    entry: Dict[str, str],
+    title: str,
+    archive_path: Optional[Path],
+    epubs: Iterable[Path],
+    status: str,
+) -> Dict[str, object]:
+    return {
+        "title": title,
+        "archive_path": str(archive_path) if archive_path else "",
+        "epubs": [str(p) for p in epubs],
+        "status": status,
+        "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_signature": build_entry_signature(entry),
+        "entry_update": (entry.get("update") or "").strip(),
+        "entry_volume": (entry.get("volume") or "").strip(),
+        "entry_remark": (entry.get("remark") or "").strip(),
+    }
+
+
 def run(args) -> int:
     merged_csv_path = Path(args.merged_csv)
     dl_txt_path = Path(args.dl_txt)
@@ -1409,9 +1474,11 @@ def run(args) -> int:
     state = load_state(state_path)
     labels_state = state.setdefault("labels", {})
     baseline_labels = set(state.setdefault("baseline_labels", []))
+    baseline_entries = state.setdefault("baseline_entries", {})
     if not baseline_labels and not args.include_existing:
         baseline_labels = set(load_all_labels(merged_csv_path))
         state["baseline_labels"] = sorted(baseline_labels)
+        state["baseline_entries"] = load_all_entry_signatures(merged_csv_path)
         state["baseline_created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         save_state(state_path, state)
         log(f"[INFO] 已建立初始基线，共 {len(baseline_labels)} 条。后续仅下载部署后新增的条目。")
@@ -1432,14 +1499,26 @@ def run(args) -> int:
         for entry in entries:
             label = entry["label"]
             title = build_entry_title(entry)
+            current_signature = build_entry_signature(entry)
             existing = labels_state.get(label)
             if existing and not args.force:
-                log(f"[INFO] 跳过已处理条目: {title} ({label})")
-                skip_cnt += 1
-                continue
+                if existing.get("entry_signature") == current_signature:
+                    log(f"[INFO] 跳过已处理条目: {title} ({label})")
+                    skip_cnt += 1
+                    continue
+                log(f"[INFO] 检测到已处理条目元数据变化，重新下载: {title} ({label})")
             if (label in baseline_labels) and not args.include_existing and not args.force:
-                skip_cnt += 1
-                continue
+                baseline_signature = baseline_entries.get(label)
+                if baseline_signature:
+                    if baseline_signature == current_signature:
+                        skip_cnt += 1
+                        continue
+                    log(f"[INFO] 检测到基线条目元数据变化，准备下载: {title} ({label})")
+                elif entry_updated_after_baseline(entry, state.get("baseline_created_at", "")):
+                    log(f"[INFO] 检测到基线条目在基线创建后更新，准备下载: {title} ({label})")
+                else:
+                    skip_cnt += 1
+                    continue
 
             url = f"https://{prefix}/{label}"
             pwd = entry["pwd"]
@@ -1472,24 +1551,24 @@ def run(args) -> int:
             if archive_path.suffix.lower() == ".epub":
                 if is_zht_name(archive_path.name):
                     log(f"[INFO] 跳过繁体 EPUB: {archive_path.name}")
-                    labels_state[label] = {
-                        "title": title,
-                        "archive_path": str(archive_path),
-                        "epubs": [],
-                        "status": "skip_zht_epub",
-                        "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    }
+                    labels_state[label] = make_state_entry(
+                        entry=entry,
+                        title=title,
+                        archive_path=archive_path,
+                        epubs=[],
+                        status="skip_zht_epub",
+                    )
                     save_state(state_path, state)
                     skip_cnt += 1
                     continue
                 copied = copy_epubs_to_output([archive_path], epub_dir)
-                labels_state[label] = {
-                    "title": title,
-                    "archive_path": str(archive_path),
-                    "epubs": [str(p) for p in copied],
-                    "status": "direct_epub",
-                    "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
+                labels_state[label] = make_state_entry(
+                    entry=entry,
+                    title=title,
+                    archive_path=archive_path,
+                    epubs=copied,
+                    status="direct_epub",
+                )
                 save_state(state_path, state)
                 log(f"[INFO] 完成: {title} 直接下载 EPUB={len(copied)}")
                 ok_cnt += 1
@@ -1503,37 +1582,37 @@ def run(args) -> int:
                 copied = copy_epubs_to_output(extracted, epub_dir)
             except Exception as e:
                 log(f"[WARN] 压缩包已下载，但提取失败: {archive_path} err={e}")
-                labels_state[label] = {
-                    "title": title,
-                    "archive_path": str(archive_path),
-                    "epubs": [],
-                    "status": "archive_only",
-                    "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
+                labels_state[label] = make_state_entry(
+                    entry=entry,
+                    title=title,
+                    archive_path=archive_path,
+                    epubs=[],
+                    status="archive_only",
+                )
                 save_state(state_path, state)
                 fail_cnt += 1
                 continue
 
             if not copied:
                 log(f"[WARN] 压缩包里没有找到 EPUB: {archive_path}")
-                labels_state[label] = {
-                    "title": title,
-                    "archive_path": str(archive_path),
-                    "epubs": [],
-                    "status": "no_epub_found",
-                    "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
+                labels_state[label] = make_state_entry(
+                    entry=entry,
+                    title=title,
+                    archive_path=archive_path,
+                    epubs=[],
+                    status="no_epub_found",
+                )
                 save_state(state_path, state)
                 fail_cnt += 1
                 continue
 
-            labels_state[label] = {
-                "title": title,
-                "archive_path": str(archive_path),
-                "epubs": [str(p) for p in copied],
-                "status": "ok",
-                "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
+            labels_state[label] = make_state_entry(
+                entry=entry,
+                title=title,
+                archive_path=archive_path,
+                epubs=copied,
+                status="ok",
+            )
             save_state(state_path, state)
             shutil.rmtree(extract_dir, ignore_errors=True)
             log(f"[INFO] 完成: {title} EPUB={len(copied)}")
