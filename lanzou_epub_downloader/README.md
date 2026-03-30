@@ -238,6 +238,31 @@ docker run --rm \
 
 这个项目默认是单次执行，不是常驻调度器。若要定时运行，建议由 VPS 上的 `cron`、`systemd timer` 或外部任务调度器触发。
 
+## OneDrive 自动上传与清理
+
+仓库还提供了一个可常驻运行的后台守护进程：
+
+```bash
+python -m lanzou_epub_downloader.onedrive_sync
+```
+
+它会：
+
+- 读取 `out/downloads/state.json` 与 `out/merged.csv`
+- 按小说主标题整理本地 EPUB，上传到 `ONEDRIVE_REMOTE_TARGET`
+- 确认远端文件大小正确后，自动删除本地 EPUB 与归档文件
+- 可选清理 `ONEDRIVE_REMOTE_ROOT` 下历史误传的平铺 EPUB
+
+常用环境变量：
+
+- `ENABLE_ONEDRIVE_UPLOAD=true`
+- `ONEDRIVE_REMOTE_TARGET=wenku8_od:轻小说/wenku8`
+- `ONEDRIVE_REMOTE_ROOT=wenku8_od:轻小说`
+- `ONEDRIVE_UPLOAD_INTERVAL_SECONDS=120`
+- `ONEDRIVE_CLEAN_REMOTE_ROOT_DUPLICATES=true`
+
+这个守护进程已经集成到主项目的 `run_scheduler.sh` 中；在 Docker 模式下，只要挂载好 `rclone.conf` 并开启 `ENABLE_ONEDRIVE_UPLOAD=true`，容器会自动后台启动它。
+
 ## 说明
 
 - 项目默认优先下载简体蓝奏“合集”压缩包，再提取其中的 `.epub`

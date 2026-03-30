@@ -86,8 +86,15 @@ jieqiUserCharset=utf-8; jieqiVisitId=...; ...
 - 首次部署时自动建立基线，不回补历史库存
 - 首次部署不会把当前 `merged.csv` 里已有的上千条历史蓝奏记录全部下载一遍
 - 之后每次有新条目进入 `merged.csv` 时，自动下载对应蓝奏资源
+- 对于已经在基线里的旧 `dl_label`，如果 `dl_update`、卷号或备注发生变化，也会重新下载
 - 优先下载简体“合集.zip/.7z/.rar”，没有合集时回退到单卷 EPUB
 - 自动提取 EPUB 到本地目录，并过滤 `zht_` / “繁体”文件
+
+如果启用 OneDrive 同步，还会同时启动一个后台守护进程：
+
+- 按小说主标题把 `out/downloads/epubs/` 重新整理到 OneDrive 的 `wenku8` 子目录
+- 上传成功并确认远端文件大小正确后，自动删除本地 EPUB 与压缩包
+- 可选清理 OneDrive 根目录下历史误传的平铺 EPUB
 
 可通过环境变量关闭该功能：
 
@@ -132,13 +139,30 @@ cp docker-compose.yml.example docker-compose.yml
 docker compose --env-file .env up -d
 ```
 
+如果要启用 OneDrive 自动上传，还需要在宿主机准备好 `rclone` 的配置文件，并挂载到容器：
+
+```text
+./rclone/rclone.conf -> /root/.config/rclone/rclone.conf
+```
+
+然后在 `.env` 里至少设置：
+
+```bash
+ENABLE_ONEDRIVE_UPLOAD=true
+ONEDRIVE_REMOTE_TARGET=wenku8_od:轻小说/wenku8
+ONEDRIVE_REMOTE_ROOT=wenku8_od:轻小说
+ONEDRIVE_UPLOAD_INTERVAL_SECONDS=120
+```
+
 运行模式：
 
 - 容器常驻运行
 - 每 `RUN_INTERVAL_SECONDS` 秒执行一次：`txt.py` + `main.py $SCRAPER`
 - `ENABLE_LANZOU_DOWNLOAD=true` 时，有新内容会自动下载并提取蓝奏 EPUB
+- `ENABLE_ONEDRIVE_UPLOAD=true` 时，容器会额外启动 OneDrive 上传/清理守护进程
 - `ENABLE_LANZOU_DOWNLOAD=false` 时，只抓取与生成页面，不执行蓝奏下载
 - 首次初始化时只建立下载基线，不会扫历史库存
+- OneDrive 上传成功后，会自动删除本地 `out/downloads/epubs/` 与 `out/downloads/archives/` 中对应文件
 - 如需手动补抓历史条目，再单独使用 `lanzou_epub_downloader/` 并显式开启 `--include-existing`
 
 静态页面会持续更新到 `docs/` 目录，可直接交给 Caddy/Nginx 等服务托管。

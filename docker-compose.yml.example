@@ -13,9 +13,21 @@ services:
       RUN_INTERVAL_SECONDS: ${RUN_INTERVAL_SECONDS:-21600}
       # 是否自动下载并提取蓝奏 EPUB（true/false）
       ENABLE_LANZOU_DOWNLOAD: ${ENABLE_LANZOU_DOWNLOAD:-true}
+      # 是否自动上传到 OneDrive，并在确认上传成功后删除本地 EPUB/压缩包
+      ENABLE_ONEDRIVE_UPLOAD: ${ENABLE_ONEDRIVE_UPLOAD:-false}
+      # rclone OneDrive 目标目录，例如 wenku8_od:轻小说/wenku8
+      ONEDRIVE_REMOTE_TARGET: ${ONEDRIVE_REMOTE_TARGET:-}
+      # rclone OneDrive 根目录，例如 wenku8_od:轻小说；留空则自动取目标目录上级
+      ONEDRIVE_REMOTE_ROOT: ${ONEDRIVE_REMOTE_ROOT:-}
+      # 上传/清理轮询间隔（秒）
+      ONEDRIVE_UPLOAD_INTERVAL_SECONDS: ${ONEDRIVE_UPLOAD_INTERVAL_SECONDS:-120}
+      # 是否清理根目录下已迁入 wenku8 子目录的重复 EPUB
+      ONEDRIVE_CLEAN_REMOTE_ROOT_DUPLICATES: ${ONEDRIVE_CLEAN_REMOTE_ROOT_DUPLICATES:-true}
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./out:/app/out
       - ./docs:/app/docs
+      # 需要提前在宿主机准备好 rclone OneDrive 配置
+      - ./rclone/rclone.conf:/root/.config/rclone/rclone.conf:ro
     command: ["sh", "/app/run_scheduler.sh"]
     restart: unless-stopped
