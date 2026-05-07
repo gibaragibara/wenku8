@@ -39,6 +39,7 @@ SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("ONEDRIVE_UPLOAD_INTERVAL_SECONDS"
 TRANSFERS = max(1, int(os.getenv("ONEDRIVE_UPLOAD_TRANSFERS", "4")))
 CHECKERS = max(1, int(os.getenv("ONEDRIVE_UPLOAD_CHECKERS", "8")))
 ROOT_CLEANUP_ENABLED = read_bool_env("ONEDRIVE_CLEAN_REMOTE_ROOT_DUPLICATES", True)
+RCLONE_COMMAND_TIMEOUT_SECONDS = max(60, int(os.getenv("RCLONE_COMMAND_TIMEOUT_SECONDS", "900")))
 
 
 def log(message: str) -> None:
@@ -112,7 +113,24 @@ def ensure_organized_tree(state: Dict[str, dict], label_to_main: Dict[str, str])
 
 def run_rclone(args: Iterable[str]) -> Tuple[int, str, str]:
     cmd = [RCLONE_BIN] + list(args)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=RCLONE_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        err = exc.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        err = (err + "\n" if err else "") + (
+            f"rclone command timed out after {RCLONE_COMMAND_TIMEOUT_SECONDS}s: {' '.join(cmd)}"
+        )
+        return 124, out, err
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -156,6 +174,41 @@ def remote_index() -> Dict[str, int]:
         for item in data
         if isinstance(item, dict) and item.get("Path")
     }
+
+
+def join_remote(remote: str, *parts: str) -> str:
+    base = remote.rstrip("/")
+    suffix = "/".join(part.strip("/") for part in parts if part)
+    return f"{base}/{suffix}" if suffix else base
+
+
+def remote_index_for_local_files(state: Dict[str, dict], label_to_main: Dict[str, str]) -> Dict[str, int]:
+    folders = set()
+    for label, payload in (state.get("labels") or {}).items():
+        main = label_to_main.get(label)
+        if not main:
+            continue
+        if any(Path(p).exists() for p in (payload.get("epubs") or []) if p):
+            folders.add(safe_name(main))
+
+    remote_map: Dict[str, int] = {}
+    for folder in sorted(folders):
+        rc, out, err = run_rclone(["lsjson", "--files-only", join_remote(REMOTE_TARGET, folder)])
+        if rc != 0:
+            if err.strip() and "directory not found" not in err.lower():
+                log(f"[REMOTE_FOLDER_ERR] {folder} {err.strip()}")
+            continue
+        try:
+            data = json.loads(out or "[]")
+        except Exception as exc:
+            log(f"[REMOTE_FOLDER_PARSE_ERR] {folder} {exc}")
+            continue
+        for item in data:
+            name = item.get("Name") or item.get("Path") or ""
+            if not name:
+                continue
+            remote_map[f"{folder}/{Path(name).name}"] = item.get("Size", -1)
+    return remote_map
 
 
 def cleanup_remote_root_duplicates(remote_map: Dict[str, int]) -> int:
@@ -269,7 +322,7 @@ def main() -> int:
             log(f"[ORGANIZE] linked_new={linked}")
 
         upload_ok = upload_cycle()
-        remote_map = remote_index() if upload_ok else {}
+        remote_map = remote_index_for_local_files(state, label_to_main) if upload_ok else {}
         if remote_map:
             cleaned = cleanup_remote_root_duplicates(remote_map)
             if cleaned:
