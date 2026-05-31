@@ -277,8 +277,11 @@ def prune_local(state: Dict[str, dict], label_to_main: Dict[str, str], remote_ma
             except Exception as exc:
                 log(f"[LOCAL_DELETE_ERR] {src} {exc}")
 
+        archive_paths = [p for p in (payload.get("archive_paths") or []) if p]
         archive_raw = payload.get("archive_path") or ""
-        if archive_raw:
+        if archive_raw and archive_raw not in archive_paths:
+            archive_paths.insert(0, archive_raw)
+        for archive_raw in archive_paths:
             archive_path = Path(archive_raw)
             try:
                 if archive_path.exists():

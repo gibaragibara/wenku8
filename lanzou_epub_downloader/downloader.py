@@ -1258,6 +1258,89 @@ def download_item_via_http(context, item: Dict[str, str], share_url: str, downlo
     return None, "no_download"
 
 
+def download_share_item(page, item: Dict[str, str], share_url: str, download_dir: Path, title: str, deadline_ts: float, timeout_ms: int):
+    item_title = item["text"] if item["kind"] == "epub" else title
+    direct_out, direct_status = download_item_via_http(
+        page.context,
+        item=item,
+        share_url=share_url,
+        download_dir=download_dir,
+        title=item_title,
+        timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+    )
+    if direct_out:
+        return direct_out, "ok"
+
+    last_status = direct_status if direct_status and direct_status != "no_download" else "no_download"
+    try:
+        page.goto(
+            item["href"],
+            referer=share_url,
+            wait_until="domcontentloaded",
+            timeout=min(timeout_left_ms(deadline_ts), 45000),
+        )
+        page.wait_for_timeout(2000)
+        candidate_urls = collect_page_download_candidates(page)
+        try:
+            candidate_urls.insert(0, page.url)
+        except Exception:
+            pass
+        browser_candidates = []
+        for browser_candidate in [page.url] + candidate_urls:
+            if not is_lanrar_file_page(browser_candidate):
+                continue
+            if "toolsdown" not in browser_candidate.lower():
+                continue
+            if browser_candidate in browser_candidates:
+                continue
+            browser_candidates.append(browser_candidate)
+        for browser_candidate in browser_candidates:
+            verify_page = None
+            try:
+                verify_page = page.context.new_page()
+                verify_page.goto(
+                    browser_candidate,
+                    referer=page.url,
+                    wait_until="domcontentloaded",
+                    timeout=min(timeout_left_ms(deadline_ts), 45000),
+                )
+                verify_page.wait_for_timeout(1500)
+                browser_final_url = resolve_browser_download_link(verify_page, deadline_ts)
+                if not browser_final_url:
+                    continue
+                direct_out = download_direct_file_via_api_request(
+                    page.context.request,
+                    browser_final_url,
+                    download_dir=download_dir,
+                    title=item_title,
+                    referer=verify_page.url,
+                    timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+                )
+                if direct_out:
+                    return direct_out, "ok"
+            finally:
+                if verify_page is not None:
+                    try:
+                        verify_page.close()
+                    except Exception:
+                        pass
+        direct_candidates = [candidate_url for candidate_url in candidate_urls if candidate_url not in browser_candidates]
+        direct_out = download_from_candidate_urls(
+            direct_candidates,
+            download_dir=download_dir,
+            title=item_title,
+            referer=page.url,
+            timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+        )
+        if direct_out:
+            return direct_out, "ok"
+        return None, "no_download"
+    except Exception as e:
+        if is_target_closed_error(e):
+            return None, "target_closed"
+        return None, f"exception: {e}"
+
+
 def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str, timeout_ms: int):
     deadline_ts = time.monotonic() + (max(timeout_ms, 10000) / 1000.0)
     page.set_default_timeout(min(timeout_ms, 15000))
@@ -1274,92 +1357,33 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str
     if not items:
         return None, "no_target_item"
 
+    bundle_items = [item for item in items if item["kind"] == "bundle"]
+    target_items = bundle_items or [item for item in items if item["kind"] == "epub"]
+    if not target_items:
+        target_items = items
+
+    downloaded: List[Path] = []
     last_status = "no_download"
-    for item in items:
-        if timeout_left_ms(deadline_ts) <= 1:
-            return None, "timeout"
-        item_title = item["text"] if item["kind"] == "epub" else title
-        direct_out, direct_status = download_item_via_http(
-            page.context,
+    for item in target_items:
+        item_deadline_ts = time.monotonic() + (max(timeout_ms, 10000) / 1000.0)
+        out_path, item_status = download_share_item(
+            page=page,
             item=item,
             share_url=url,
             download_dir=download_dir,
-            title=item_title,
-            timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+            title=title,
+            deadline_ts=item_deadline_ts,
+            timeout_ms=timeout_ms,
         )
-        if direct_out:
-            return direct_out, "ok"
-        if direct_status and direct_status != "no_download":
-            last_status = direct_status
-        try:
-            page.goto(
-                item["href"],
-                referer=url,
-                wait_until="domcontentloaded",
-                timeout=min(timeout_left_ms(deadline_ts), 45000),
-            )
-            page.wait_for_timeout(2000)
-            candidate_urls = collect_page_download_candidates(page)
-            # 把目标页 URL 也塞进候选队列，便于后续解析 toolsdown/ajax.php。
-            try:
-                candidate_urls.insert(0, page.url)
-            except Exception:
-                pass
-            browser_candidates = []
-            for browser_candidate in [page.url] + candidate_urls:
-                if not is_lanrar_file_page(browser_candidate):
-                    continue
-                if "toolsdown" not in browser_candidate.lower():
-                    continue
-                if browser_candidate in browser_candidates:
-                    continue
-                browser_candidates.append(browser_candidate)
-            for browser_candidate in browser_candidates:
-                verify_page = None
-                try:
-                    verify_page = page.context.new_page()
-                    verify_page.goto(
-                        browser_candidate,
-                        referer=page.url,
-                        wait_until="domcontentloaded",
-                        timeout=min(timeout_left_ms(deadline_ts), 45000),
-                    )
-                    verify_page.wait_for_timeout(1500)
-                    browser_final_url = resolve_browser_download_link(verify_page, deadline_ts)
-                    if not browser_final_url:
-                        continue
-                    direct_out = download_direct_file_via_api_request(
-                        page.context.request,
-                        browser_final_url,
-                        download_dir=download_dir,
-                        title=item_title,
-                        referer=verify_page.url,
-                        timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
-                    )
-                    if direct_out:
-                        return direct_out, "ok"
-                finally:
-                    if verify_page is not None:
-                        try:
-                            verify_page.close()
-                        except Exception:
-                            pass
-            direct_candidates = [url for url in candidate_urls if url not in browser_candidates]
-            direct_out = download_from_candidate_urls(
-                direct_candidates,
-                download_dir=download_dir,
-                title=item_title,
-                referer=page.url,
-                timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
-            )
-            if direct_out:
-                return direct_out, "ok"
-            last_status = "no_download"
-        except Exception as e:
-            if is_target_closed_error(e):
-                last_status = "target_closed"
-            else:
-                last_status = f"exception: {e}"
+        if out_path:
+            downloaded.append(out_path)
+            log(f"[INFO] 已下载蓝奏文件: {item['text']} -> {out_path}")
+            continue
+        if item_status and item_status != "no_download":
+            last_status = item_status
+
+    if downloaded:
+        return downloaded, "ok"
     return None, last_status
 
 
@@ -1442,10 +1466,15 @@ def make_state_entry(
     archive_path: Optional[Path],
     epubs: Iterable[Path],
     status: str,
+    archive_paths: Optional[Iterable[Path]] = None,
 ) -> Dict[str, object]:
+    archive_path_list = [str(p) for p in (archive_paths or [])]
+    if archive_path and str(archive_path) not in archive_path_list:
+        archive_path_list.insert(0, str(archive_path))
     return {
         "title": title,
         "archive_path": str(archive_path) if archive_path else "",
+        "archive_paths": archive_path_list,
         "epubs": [str(p) for p in epubs],
         "status": status,
         "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1523,11 +1552,11 @@ def run(args) -> int:
             url = f"https://{prefix}/{label}"
             pwd = entry["pwd"]
             page = context.new_page()
-            archive_path: Optional[Path] = None
+            downloaded_paths: List[Path] = []
             status = "unknown"
             try:
                 log(f"[INFO] 下载蓝奏条目: {title} ({url})")
-                archive_path, status = download_one_lanzou(
+                download_result, status = download_one_lanzou(
                     page=page,
                     url=url,
                     pwd=pwd,
@@ -1535,6 +1564,10 @@ def run(args) -> int:
                     title=title,
                     timeout_ms=args.timeout_ms,
                 )
+                if isinstance(download_result, list):
+                    downloaded_paths = [Path(p) for p in download_result]
+                elif download_result:
+                    downloaded_paths = [Path(download_result)]
             except Exception as e:
                 status = f"exception: {e}"
             finally:
@@ -1543,62 +1576,77 @@ def run(args) -> int:
                 except Exception:
                     pass
 
-            if not archive_path:
+            if not downloaded_paths:
                 log(f"[WARN] 下载失败: {title} status={status}")
                 fail_cnt += 1
                 continue
 
-            if archive_path.suffix.lower() == ".epub":
-                if is_zht_name(archive_path.name):
-                    log(f"[INFO] 跳过繁体 EPUB: {archive_path.name}")
+            direct_epubs = [p for p in downloaded_paths if p.suffix.lower() == ".epub"]
+            archive_paths = [p for p in downloaded_paths if p.suffix.lower() != ".epub"]
+            copied: List[Path] = []
+
+            if direct_epubs:
+                usable_epubs = [p for p in direct_epubs if not is_zht_name(p.name)]
+                skipped_zht = len(direct_epubs) - len(usable_epubs)
+                if skipped_zht:
+                    log(f"[INFO] 跳过繁体 EPUB={skipped_zht}")
+                copied.extend(copy_epubs_to_output(usable_epubs, epub_dir))
+                if copied and not archive_paths:
                     labels_state[label] = make_state_entry(
                         entry=entry,
                         title=title,
-                        archive_path=archive_path,
+                        archive_path=direct_epubs[0],
+                        archive_paths=direct_epubs,
+                        epubs=copied,
+                        status="direct_epub",
+                    )
+                    save_state(state_path, state)
+                    log(f"[INFO] 完成: {title} 直接下载 EPUB={len(copied)}")
+                    ok_cnt += 1
+                    continue
+                if not copied and not archive_paths:
+                    labels_state[label] = make_state_entry(
+                        entry=entry,
+                        title=title,
+                        archive_path=direct_epubs[0],
+                        archive_paths=direct_epubs,
                         epubs=[],
                         status="skip_zht_epub",
                     )
                     save_state(state_path, state)
                     skip_cnt += 1
                     continue
-                copied = copy_epubs_to_output([archive_path], epub_dir)
-                labels_state[label] = make_state_entry(
-                    entry=entry,
-                    title=title,
-                    archive_path=archive_path,
-                    epubs=copied,
-                    status="direct_epub",
-                )
-                save_state(state_path, state)
-                log(f"[INFO] 完成: {title} 直接下载 EPUB={len(copied)}")
-                ok_cnt += 1
-                continue
 
             extract_dir = extract_root / safe_filename(label)
             if extract_dir.exists():
                 shutil.rmtree(extract_dir, ignore_errors=True)
-            try:
-                extracted = extract_archive(archive_path, extract_dir)
-                copied = copy_epubs_to_output(extracted, epub_dir)
-            except Exception as e:
-                log(f"[WARN] 压缩包已下载，但提取失败: {archive_path} err={e}")
-                labels_state[label] = make_state_entry(
-                    entry=entry,
-                    title=title,
-                    archive_path=archive_path,
-                    epubs=[],
-                    status="archive_only",
-                )
-                save_state(state_path, state)
-                fail_cnt += 1
-                continue
+            if archive_paths:
+                try:
+                    for archive_path in archive_paths:
+                        item_extract_dir = extract_dir / safe_filename(archive_path.stem)
+                        extracted = extract_archive(archive_path, item_extract_dir)
+                        copied.extend(copy_epubs_to_output(extracted, epub_dir))
+                except Exception as e:
+                    log(f"[WARN] 压缩包已下载，但提取失败: {archive_paths} err={e}")
+                    labels_state[label] = make_state_entry(
+                        entry=entry,
+                        title=title,
+                        archive_path=archive_paths[0] if archive_paths else None,
+                        archive_paths=archive_paths,
+                        epubs=[],
+                        status="archive_only",
+                    )
+                    save_state(state_path, state)
+                    fail_cnt += 1
+                    continue
 
             if not copied:
-                log(f"[WARN] 压缩包里没有找到 EPUB: {archive_path}")
+                log(f"[WARN] 下载文件里没有找到 EPUB: {downloaded_paths}")
                 labels_state[label] = make_state_entry(
                     entry=entry,
                     title=title,
-                    archive_path=archive_path,
+                    archive_path=downloaded_paths[0],
+                    archive_paths=downloaded_paths,
                     epubs=[],
                     status="no_epub_found",
                 )
@@ -1609,7 +1657,8 @@ def run(args) -> int:
             labels_state[label] = make_state_entry(
                 entry=entry,
                 title=title,
-                archive_path=archive_path,
+                archive_path=archive_paths[0] if archive_paths else (direct_epubs[0] if direct_epubs else None),
+                archive_paths=downloaded_paths,
                 epubs=copied,
                 status="ok",
             )
