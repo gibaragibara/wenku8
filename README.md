@@ -158,12 +158,15 @@ ONEDRIVE_UPLOAD_INTERVAL_SECONDS=120
 
 ```bash
 WENKU8_CPU_LIMIT=0.70
+WENKU8_MEMORY_LIMIT=512m
+WENKU8_PIDS_LIMIT=128
 SCRAPE_TIMEOUT_SECONDS=1800
 LANZOU_RUN_TIMEOUT_SECONDS=600
 LANZOU_ENTRY_TIMEOUT_SECONDS=360
+LANZOU_MAX_DOWNLOAD_BYTES=2147483648
 ```
 
-蓝奏下载会在独立进程中运行。达到硬超时后，下载器及其 Chromium 子进程会一起终止；Compose 的 CPU 配额可避免异常页面持续占满宿主机单核。
+蓝奏文件使用 Python 流式写盘，不会通过 Playwright 在 Node 内存中缓存整个响应。下载器在独立进程中运行，达到硬超时后会连同 Chromium 子进程一起终止；Compose 的 CPU、内存和 PID 边界可避免异常页面拖垮宿主机。
 
 运行模式：
 

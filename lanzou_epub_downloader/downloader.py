@@ -684,79 +684,88 @@ def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional
     return final_url
 
 
+def max_download_bytes() -> int:
+    default = 2 * 1024 * 1024 * 1024
+    try:
+        configured = int(os.getenv("LANZOU_MAX_DOWNLOAD_BYTES", str(default)))
+    except (TypeError, ValueError):
+        return default
+    return configured if configured > 0 else default
+
+
+def sync_browser_cookies_to_session(context, url: str) -> None:
+    try:
+        cookies = context.cookies([url])
+    except Exception:
+        return
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        kwargs = {"path": cookie.get("path") or "/"}
+        if cookie.get("domain"):
+            kwargs["domain"] = cookie["domain"]
+        SESSION.cookies.set(name, value, **kwargs)
+
+
 def download_direct_file(url: str, download_dir: Path, title: str, referer: str, timeout_ms: int) -> Optional[Path]:
     if timeout_ms <= 0:
         return None
-    timeout_s = bounded_timeout_s(timeout_ms, min_s=1.0, max_s=90.0)
+    deadline_ts = time.monotonic() + (timeout_ms / 1000.0)
+    request_timeout_s = bounded_timeout_s(timeout_ms, min_s=1.0, max_s=30.0)
     try:
-        resp = requests.get(
+        resp = SESSION.get(
             url,
             headers={"User-Agent": random.choice(USER_AGENTS), "Referer": referer or url},
-            timeout=timeout_s,
+            timeout=(min(request_timeout_s, 10.0), min(request_timeout_s, 15.0)),
             allow_redirects=True,
             stream=True,
         )
     except Exception:
         return None
+    partial: Optional[Path] = None
     try:
         if resp.status_code >= 400:
             return None
+        byte_limit = max_download_bytes()
+        try:
+            declared_size = int(resp.headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            declared_size = 0
+        if declared_size > byte_limit:
+            log(
+                f"[WARN] 蓝奏文件超过下载上限，拒绝缓存: "
+                f"size={declared_size} limit={byte_limit} title={title}"
+            )
+            return None
         filename = infer_filename_from_response(resp, fallback_title=title, fallback_ext=".zip")
         target = unique_path(download_dir, filename)
+        partial = unique_path(download_dir, f"{filename}.part")
         size = 0
-        with target.open("wb") as f:
+        with partial.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=65536):
                 if not chunk:
                     continue
+                if timeout_left_ms(deadline_ts) <= 0:
+                    return None
+                if size + len(chunk) > byte_limit:
+                    log(
+                        f"[WARN] 蓝奏流式下载超过上限，已中止: "
+                        f"limit={byte_limit} title={title}"
+                    )
+                    return None
                 f.write(chunk)
                 size += len(chunk)
         if size > 0:
+            partial.replace(target)
+            partial = None
             return target
-        try:
-            target.unlink()
-        except Exception:
-            pass
         return None
     finally:
+        safe_unlink(partial)
         try:
             resp.close()
-        except Exception:
-            pass
-
-
-def download_direct_file_via_api_request(api_request, url: str, download_dir: Path, title: str, referer: str, timeout_ms: int) -> Optional[Path]:
-    if timeout_ms <= 0:
-        return None
-    api_timeout = max(50, min(int(timeout_ms), 90000))
-    try:
-        resp = api_request.get(
-            url,
-            headers={
-                "Referer": referer or url,
-                "User-Agent": random.choice(USER_AGENTS),
-            },
-            timeout=api_timeout,
-        )
-    except Exception:
-        return None
-    try:
-        if not resp.ok:
-            return None
-        filename = infer_filename_from_headers(
-            resp.headers,
-            resp.url,
-            fallback_title=title,
-            fallback_ext=".zip",
-        )
-        target = unique_path(download_dir, filename)
-        body = resp.body()
-        if not body:
-            return None
-        target.write_bytes(body)
-        return target
-    finally:
-        try:
-            resp.dispose()
         except Exception:
             pass
 
@@ -1468,8 +1477,8 @@ def download_item_via_http(context, item: Dict[str, str], share_url: str, downlo
         operation_timeout_ms = remaining_timeout_ms(deadline_ts, 90000)
         if operation_timeout_ms <= 0:
             return None, "timeout"
-        downloaded = download_direct_file_via_api_request(
-            context.request,
+        sync_browser_cookies_to_session(context, final_url)
+        downloaded = download_direct_file(
             final_url,
             download_dir=download_dir,
             title=title,
@@ -1544,8 +1553,8 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
                 operation_timeout_ms = remaining_timeout_ms(deadline_ts, timeout_ms)
                 if operation_timeout_ms <= 0:
                     return None, "timeout"
-                direct_out = download_direct_file_via_api_request(
-                    page.context.request,
+                sync_browser_cookies_to_session(page.context, browser_final_url)
+                direct_out = download_direct_file(
                     browser_final_url,
                     download_dir=download_dir,
                     title=item_title,

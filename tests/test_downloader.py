@@ -58,6 +58,60 @@ class DownloaderHelpersTest(unittest.TestCase):
             self.assertFalse(orphan.exists())
             self.assertFalse(generic.exists())
 
+    def test_direct_download_streams_to_disk(self):
+        class FakeResponse:
+            status_code = 200
+            url = "https://example.test/book.zip"
+            headers = {
+                "content-disposition": 'attachment; filename="book.zip"',
+                "content-length": "6",
+            }
+
+            def iter_content(self, chunk_size):
+                self.assert_chunk_size = chunk_size
+                yield b"abc"
+                yield b"def"
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            response = FakeResponse()
+            with mock.patch.object(downloader.SESSION, "get", return_value=response):
+                path = downloader.download_direct_file(
+                    "https://example.test/book.zip",
+                    Path(tmp),
+                    "book",
+                    "https://example.test/share",
+                    1000,
+                )
+
+            self.assertIsNotNone(path)
+            self.assertEqual(path.read_bytes(), b"abcdef")
+            self.assertEqual(response.assert_chunk_size, 65536)
+            self.assertEqual(list(Path(tmp).glob("*.part")), [])
+
+    def test_direct_download_rejects_oversize_response(self):
+        response = mock.Mock()
+        response.status_code = 200
+        response.headers = {"content-length": "5"}
+        response.close = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"LANZOU_MAX_DOWNLOAD_BYTES": "4"}):
+                with mock.patch.object(downloader.SESSION, "get", return_value=response):
+                    path = downloader.download_direct_file(
+                        "https://example.test/book.zip",
+                        Path(tmp),
+                        "book",
+                        "https://example.test/share",
+                        1000,
+                    )
+
+            self.assertIsNone(path)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            response.iter_content.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
