@@ -17,9 +17,20 @@ jobs:
       with:
         python-version: "3.11"
 
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
     - name: Compile Check
       run: |
-        python -m py_compile main.py txt.py auto_run.py
+        python -m py_compile \
+          main.py \
+          txt.py \
+          auto_run.py \
+          lanzou_epub_downloader/downloader.py \
+          lanzou_epub_downloader/onedrive_sync.py
+
+    - name: Unit tests
+      run: python -m unittest discover -s tests -v
 
   docker-build-push:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

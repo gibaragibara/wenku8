@@ -11,11 +11,11 @@ from requests.packages.urllib3.util.retry import Retry
 import re
 import json
 import os
+import signal
+import subprocess
 from pathlib import Path
 import pandas as pd
-import sys
 import html as html_lib
-from types import SimpleNamespace
 
 BASE_URL = 'https://www.wenku8.net/modules/article/reviewslist.php'
 params = { 'keyword': '8691', 'charset': 'utf-8', 'page': 1 }
@@ -1238,18 +1238,43 @@ def download_one_lanzou(page, url: str, pwd: str, download_dir: str, title: str,
     download.save_as(target)
     return target, 'ok'
 
+def run_process_group(command, timeout_seconds: int) -> int:
+    process = subprocess.Popen(
+        command,
+        start_new_session=(os.name == 'posix'),
+    )
+    try:
+        return process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        if os.name == 'posix':
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
+
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if os.name == 'posix':
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.wait()
+        return 124
+
+
 def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeout_ms: int = 30000, headless: bool = True):
     if not os.path.exists(MERGED_CSV):
         print(f'[WARN] MERGED_CSV not found: {MERGED_CSV}')
-        return
+        return 1
     if not os.path.exists(DL_FILE):
         print(f'[WARN] DL_FILE not found: {DL_FILE}')
-        return
-    try:
-        from lanzou_epub_downloader import downloader as lanzou_downloader
-    except Exception as e:
-        print(f'[ERROR] Failed to import integrated lanzou downloader: {e}')
-        return
+        return 1
 
     output_dir = os.getenv('LZ_OUTPUT_DIR', download_dir).strip() or download_dir
     timeout_ms = read_int_env('LZ_TIMEOUT_MS', timeout_ms)
@@ -1260,27 +1285,45 @@ def download_lanzou_files(new_entries, download_dir: str, limit: int = 0, timeou
     name_contains = os.getenv('LZ_NAME_CONTAINS', '').strip()
 
     os.makedirs(output_dir, exist_ok=True)
-    args = SimpleNamespace(
-        merged_csv=MERGED_CSV,
-        dl_txt=DL_FILE,
-        output_dir=output_dir,
-        limit=limit,
-        name_contains=name_contains,
-        timeout_ms=timeout_ms,
-        show_browser=show_browser,
-        force=force,
-        include_existing=include_existing,
-    )
+    command = [
+        sys.executable,
+        '-m',
+        'lanzou_epub_downloader.downloader',
+        '--merged-csv',
+        MERGED_CSV,
+        '--dl-txt',
+        DL_FILE,
+        '--output-dir',
+        output_dir,
+        '--timeout-ms',
+        str(timeout_ms),
+    ]
+    if limit > 0:
+        command.extend(['--limit', str(limit)])
+    if name_contains:
+        command.extend(['--name-contains', name_contains])
+    if show_browser:
+        command.append('--show-browser')
+    if force:
+        command.append('--force')
+    if include_existing:
+        command.append('--include-existing')
+
+    run_timeout_seconds = max(60, read_int_env('LANZOU_RUN_TIMEOUT_SECONDS', 600))
     print(
-        '[INFO] running integrated lanzou epub downloader: '
+        '[INFO] running isolated lanzou epub downloader: '
         f'output_dir={output_dir} include_existing={include_existing} force={force} '
-        f'limit={limit} timeout_ms={timeout_ms}'
+        f'limit={limit} timeout_ms={timeout_ms} hard_timeout={run_timeout_seconds}s'
     )
-    rc = lanzou_downloader.run(args)
+    rc = run_process_group(command, run_timeout_seconds)
+    if rc == 124:
+        print(f'[ERROR] lanzou epub downloader timed out after {run_timeout_seconds}s; process group terminated.')
+        return rc
     if rc != 0:
-        print('[WARN] integrated lanzou epub downloader finished with non-zero status.')
+        print(f'[WARN] lanzou epub downloader finished with status={rc}.')
     else:
-        print('[INFO] integrated lanzou epub downloader finished successfully.')
+        print('[INFO] lanzou epub downloader finished successfully.')
+    return rc
 
 def parse_args():
     parser = argparse.ArgumentParser(description='wenku8 scraper and site generator')
@@ -1305,8 +1348,8 @@ def main():
     create_html_epub()
     if not read_bool_env('ENABLE_LANZOU_DOWNLOAD', True):
         print('[INFO] ENABLE_LANZOU_DOWNLOAD=false, skip lanzou auto download.')
-        return
-    download_lanzou_files(
+        return 0
+    return download_lanzou_files(
         new_entries,
         DOWNLOAD_DIR,
         limit=0,
@@ -1318,4 +1361,4 @@ if __name__ == '__main__':
     args = parse_args()
     _scraper = args.scraper
     print(f'[INFO] Using scraper: {_scraper}')
-    main()
+    raise SystemExit(main())

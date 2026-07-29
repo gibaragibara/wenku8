@@ -66,6 +66,119 @@ def unique_path(base_dir: Path, filename: str) -> Path:
         i += 1
 
 
+def safe_unlink(path: Optional[Path]) -> bool:
+    if not path:
+        return False
+    try:
+        p = Path(path)
+        if p.is_file():
+            p.unlink()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def is_generic_bundle_name(name: str) -> bool:
+    stem = Path(name or "").stem.lower()
+    return stem == "合集" or stem.startswith("合集_") or stem in {"collection", "bundle", "pack"}
+
+
+def archive_name_for_label(label: str, original_name: str) -> str:
+    """Stable name per (label, 合集序号): b04euduna_合集1.zip / b04euduna_合集2.zip."""
+    label_safe = safe_filename(label or "unknown")
+    orig = Path(original_name or "合集.zip")
+    stem = safe_filename(orig.stem) or "合集"
+    suffix = orig.suffix.lower() if orig.suffix else ".zip"
+    if suffix not in {".zip", ".7z", ".rar", ".epub"}:
+        suffix = ".zip"
+    # Keep 合集1/合集2/合集3 distinct under the same share label
+    return f"{label_safe}_{stem}{suffix}"
+
+
+def finalize_download_path(
+    path: Path,
+    download_dir: Path,
+    label: str,
+    original_name: str = "",
+) -> Path:
+    """Rename download to {label}_{合集N}.zip so multi-bundle shares don't collide."""
+    if not path or not path.exists():
+        return path
+    label = (label or "").strip()
+    if not label:
+        return path
+    src_name = original_name or path.name
+    preferred = download_dir / archive_name_for_label(label, src_name)
+    if path.resolve() == preferred.resolve():
+        return path
+    try:
+        if preferred.exists():
+            preferred.unlink()
+        path.replace(preferred)
+        return preferred
+    except Exception:
+        try:
+            shutil.copy2(path, preferred)
+            path.unlink(missing_ok=True)
+            return preferred
+        except Exception:
+            return path
+
+
+def cleanup_local_files(paths: Iterable[Path], reason: str = "") -> int:
+    deleted = 0
+    for raw in paths:
+        p = Path(raw)
+        if safe_unlink(p):
+            deleted += 1
+    if deleted and reason:
+        log(f"[INFO] 已删除本地文件 {deleted} 个 ({reason})")
+    return deleted
+
+
+def referenced_local_paths(state: Dict[str, dict]) -> set:
+    refs = set()
+    for payload in (state.get("labels") or {}).values():
+        for key in ("archive_path",):
+            val = payload.get(key) or ""
+            if val:
+                refs.add(str(Path(val)))
+        for key in ("archive_paths", "epubs"):
+            for val in payload.get(key) or []:
+                if val:
+                    refs.add(str(Path(val)))
+    return refs
+
+
+def cleanup_orphan_archives(archive_dir: Path, state: Dict[str, dict]) -> int:
+    """Remove leftover generic 合集 / 合集_N piles and archives no longer referenced."""
+    if not archive_dir.exists():
+        return 0
+    refs = referenced_local_paths(state)
+    ref_names = {Path(r).name for r in refs}
+    deleted = 0
+    for path in list(archive_dir.iterdir()):
+        if not path.is_file():
+            continue
+        name = path.name
+        name_l = name.lower()
+        if not name_l.endswith((".zip", ".7z", ".rar", ".epub")):
+            continue
+        # Always drop generic collision names from older builds (合集.zip / 合集_27.zip)
+        if is_generic_bundle_name(name):
+            if safe_unlink(path):
+                deleted += 1
+            continue
+        # Drop archives not referenced by state (already extracted & pruned)
+        if name_l.endswith((".zip", ".7z", ".rar")) and name not in ref_names:
+            if safe_unlink(path):
+                deleted += 1
+    if deleted:
+        log(f"[INFO] 清理残留 archives={deleted}")
+    return deleted
+
+
 def parse_prefix(dl_txt_path: Path) -> str:
     first_line = dl_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines()[0]
     m = re.search(r"网址前缀：([^<\s]+)", first_line)
@@ -191,9 +304,31 @@ def first_locator_any_scope(page, selectors):
     return None
 
 
-def timeout_left_ms(deadline_ts: float, min_ms: int = 1) -> int:
+def timeout_left_ms(deadline_ts: float) -> int:
+    """Milliseconds remaining until deadline. Returns 0 when expired.
+
+    Callers must treat 0 as stop now. Never inflate remaining time above
+    the real deadline (the old min_ms=1 default caused post-deadline retries).
+    """
     left = int((deadline_ts - time.monotonic()) * 1000)
-    return left if left > min_ms else min_ms
+    if left <= 0:
+        return 0
+    return left
+
+
+def bounded_timeout_s(timeout_ms: int, *, min_s: float = 1.0, max_s: float = 60.0) -> float:
+    """Convert timeout_ms to seconds for requests/playwright."""
+    if timeout_ms is None or timeout_ms <= 0:
+        return 0.05
+    seconds = float(timeout_ms) / 1000.0
+    if seconds < min_s:
+        return max(0.05, seconds)
+    return min(max_s, seconds)
+
+
+def remaining_timeout_ms(deadline_ts: float, cap_ms: int) -> int:
+    """Return a timeout that cannot extend an existing operation deadline."""
+    return min(timeout_left_ms(deadline_ts), max(0, int(cap_ms)))
 
 
 def is_target_closed_error(err) -> bool:
@@ -466,19 +601,29 @@ def extract_ajaxm_file_id(text: str) -> Optional[str]:
 
 
 def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional[str]:
-    timeout_s = max(10, int(timeout_ms / 1000))
+    if timeout_ms <= 0:
+        return None
+    deadline_ts = time.monotonic() + (timeout_ms / 1000.0)
+    request_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+    if request_timeout_ms <= 0:
+        return None
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Referer": referer or url,
     }
     try:
-        resp = SESSION.get(url, headers=headers, timeout=timeout_s)
+        resp = SESSION.get(
+            url,
+            headers=headers,
+            timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
+        )
     except Exception:
         return None
     try:
         if resp.status_code >= 400:
             return None
         text = resp.text
+        response_url = resp.url
     finally:
         try:
             resp.close()
@@ -502,11 +647,19 @@ def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional
     }
     ajax_headers = {
         "User-Agent": headers["User-Agent"],
-        "Referer": resp.url if "resp" in locals() and getattr(resp, "url", None) else (referer or url),
+        "Referer": response_url,
         "X-Requested-With": "XMLHttpRequest",
     }
+    request_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+    if request_timeout_ms <= 0:
+        return None
     try:
-        ajax_resp = SESSION.post(ajax_url, headers=ajax_headers, data=payload, timeout=timeout_s)
+        ajax_resp = SESSION.post(
+            ajax_url,
+            headers=ajax_headers,
+            data=payload,
+            timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
+        )
     except Exception:
         return None
     try:
@@ -532,7 +685,9 @@ def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional
 
 
 def download_direct_file(url: str, download_dir: Path, title: str, referer: str, timeout_ms: int) -> Optional[Path]:
-    timeout_s = max(10, int(timeout_ms / 1000))
+    if timeout_ms <= 0:
+        return None
+    timeout_s = bounded_timeout_s(timeout_ms, min_s=1.0, max_s=90.0)
     try:
         resp = requests.get(
             url,
@@ -570,6 +725,9 @@ def download_direct_file(url: str, download_dir: Path, title: str, referer: str,
 
 
 def download_direct_file_via_api_request(api_request, url: str, download_dir: Path, title: str, referer: str, timeout_ms: int) -> Optional[Path]:
+    if timeout_ms <= 0:
+        return None
+    api_timeout = max(50, min(int(timeout_ms), 90000))
     try:
         resp = api_request.get(
             url,
@@ -577,7 +735,7 @@ def download_direct_file_via_api_request(api_request, url: str, download_dir: Pa
                 "Referer": referer or url,
                 "User-Agent": random.choice(USER_AGENTS),
             },
-            timeout=timeout_ms,
+            timeout=api_timeout,
         )
     except Exception:
         return None
@@ -604,19 +762,32 @@ def download_direct_file_via_api_request(api_request, url: str, download_dir: Pa
 
 
 def download_from_candidate_urls(candidates: Iterable[str], download_dir: Path, title: str, referer: str, timeout_ms: int) -> Optional[Path]:
+    if timeout_ms <= 0:
+        return None
     queue: List[Tuple[str, str]] = []
-    for candidate in list(candidates)[:30]:
+    for candidate in list(candidates)[:12]:
         queue.append((candidate, referer))
     seen = set()
-    timeout_s = max(10, int(timeout_ms / 1000))
-    while queue:
+    deadline_ts = time.monotonic() + (timeout_ms / 1000.0)
+    max_attempts = 16
+    max_queue = 24
+    attempts = 0
+    while queue and attempts < max_attempts:
+        left_ms = timeout_left_ms(deadline_ts)
+        if left_ms <= 0:
+            break
         url, current_referer = queue.pop(0)
         if url in seen:
             continue
         seen.add(url)
+        attempts += 1
+        request_timeout_ms = min(left_ms, 45000)
+        timeout_s = bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=45.0)
         if is_lanrar_file_page(url):
-            resolved = resolve_lanrar_ajax_url(url, referer=current_referer or url, timeout_ms=timeout_ms)
-            if resolved and resolved not in seen:
+            resolved = resolve_lanrar_ajax_url(
+                url, referer=current_referer or url, timeout_ms=request_timeout_ms
+            )
+            if resolved and resolved not in seen and len(queue) < max_queue:
                 queue.insert(0, (resolved, url))
             continue
         try:
@@ -638,14 +809,17 @@ def download_from_candidate_urls(candidates: Iterable[str], download_dir: Path, 
             )
             if is_html_like:
                 if is_lanrar_file_page(resp.url):
-                    resolved = resolve_lanrar_ajax_url(resp.url, referer=current_referer or resp.url, timeout_ms=timeout_ms)
-                    if resolved and resolved not in seen:
+                    resolved = resolve_lanrar_ajax_url(
+                        resp.url, referer=current_referer or resp.url, timeout_ms=request_timeout_ms
+                    )
+                    if resolved and resolved not in seen and len(queue) < max_queue:
                         queue.insert(0, (resolved, resp.url))
-                body = resp.text[:300000]
-                nested = extract_candidate_urls_from_text(body, resp.url)
-                for nested_url in nested:
-                    if nested_url not in seen:
-                        queue.append((nested_url, resp.url))
+                if attempts <= 8 and len(queue) < max_queue:
+                    body = resp.text[:120000]
+                    nested = extract_candidate_urls_from_text(body, resp.url)
+                    for nested_url in nested[:6]:
+                        if nested_url not in seen and len(queue) < max_queue:
+                            queue.append((nested_url, resp.url))
                 continue
 
             filename = infer_filename_from_response(resp, fallback_title=title, fallback_ext=".zip")
@@ -655,9 +829,11 @@ def download_from_candidate_urls(candidates: Iterable[str], download_dir: Path, 
                 for chunk in resp.iter_content(chunk_size=65536):
                     if not chunk:
                         continue
+                    if timeout_left_ms(deadline_ts) <= 0:
+                        break
                     f.write(chunk)
                     size += len(chunk)
-            if size > 0:
+            if size > 0 and timeout_left_ms(deadline_ts) > 0:
                 return target
             try:
                 target.unlink()
@@ -672,7 +848,9 @@ def download_from_candidate_urls(candidates: Iterable[str], download_dir: Path, 
 
 
 def fetch_share_items_via_ajax(page_url: str, pwd: str, timeout_ms: int) -> List[Dict[str, str]]:
-    timeout_s = max(10, int(timeout_ms / 1000))
+    if timeout_ms <= 0:
+        return []
+    timeout_s = bounded_timeout_s(timeout_ms, min_s=1.0, max_s=30.0)
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Referer": page_url,
@@ -938,18 +1116,25 @@ def collect_share_items(page) -> List[Dict[str, str]]:
 
 
 def pick_share_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """If any 合集 exists, return ALL 合集 (skip single-volume epubs entirely).
+
+    Multi-part shares like 实力至上 have 合集1.zip / 合集2.zip / 合集3.zip — all needed.
+    """
     bundle_items = [
         item
         for item in items
         if item["kind"] == "bundle" and not is_zht_item(item)
     ]
-    plain_bundle_items = sorted(bundle_items, key=item_priority)
+    if bundle_items:
+        # Sort zip first; keep every distinct 合集 (cap avoids runaway pages)
+        max_bundles = max(1, int(os.getenv("LANZOU_MAX_BUNDLES", "20")))
+        return sorted(bundle_items, key=item_priority)[:max_bundles]
     epub_items = [
         item
         for item in items
         if item["kind"] == "epub" and not is_zht_item(item)
     ]
-    return plain_bundle_items + sorted(epub_items, key=item_priority)
+    return sorted(epub_items, key=item_priority)
 
 
 def open_share_item_page(context, item: Dict[str, str], timeout_ms: int):
@@ -1054,7 +1239,10 @@ def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0, verify
                 verify_loc.click(force=True)
             except Exception:
                 pass
-            page.wait_for_timeout(2200)
+            wait_ms = remaining_timeout_ms(deadline_ts, 2200)
+            if wait_ms <= 0:
+                return None
+            page.wait_for_timeout(wait_ms)
             async_dl = wait_for_async_download(page, min(timeout_left_ms(deadline_ts), 9000))
             if async_dl is not None:
                 return async_dl
@@ -1113,13 +1301,22 @@ def resolve_verify_and_download(page, deadline_ts: float, depth: int = 0, verify
 
 
 def resolve_item_candidate_url(item_url: str, referer: str, timeout_ms: int) -> Tuple[Optional[str], Optional[str], str]:
-    timeout_s = max(10, int(timeout_ms / 1000))
+    if timeout_ms <= 0:
+        return None, None, "timeout"
+    deadline_ts = time.monotonic() + (timeout_ms / 1000.0)
     item_headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Referer": referer or item_url,
     }
+    request_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+    if request_timeout_ms <= 0:
+        return None, None, "timeout"
     try:
-        item_resp = SESSION.get(item_url, headers=item_headers, timeout=timeout_s)
+        item_resp = SESSION.get(
+            item_url,
+            headers=item_headers,
+            timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
+        )
     except Exception as e:
         return None, None, f"item_request_error:{e}"
     try:
@@ -1139,8 +1336,15 @@ def resolve_item_candidate_url(item_url: str, referer: str, timeout_ms: int) -> 
         "User-Agent": item_headers["User-Agent"],
         "Referer": item_page_url,
     }
+    request_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+    if request_timeout_ms <= 0:
+        return None, None, "timeout"
     try:
-        iframe_resp = SESSION.get(iframe_url, headers=iframe_headers, timeout=timeout_s)
+        iframe_resp = SESSION.get(
+            iframe_url,
+            headers=iframe_headers,
+            timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
+        )
     except Exception as e:
         return None, None, f"iframe_request_error:{e}"
     try:
@@ -1175,8 +1379,16 @@ def resolve_item_candidate_url(item_url: str, referer: str, timeout_ms: int) -> 
         "Referer": iframe_url,
         "X-Requested-With": "XMLHttpRequest",
     }
+    request_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+    if request_timeout_ms <= 0:
+        return None, None, "timeout"
     try:
-        ajax_resp = SESSION.post(ajax_url, headers=ajax_headers, data=payload, timeout=timeout_s)
+        ajax_resp = SESSION.post(
+            ajax_url,
+            headers=ajax_headers,
+            data=payload,
+            timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
+        )
     except Exception as e:
         return None, None, f"ajaxm_request_error:{e}"
     try:
@@ -1202,10 +1414,13 @@ def resolve_item_candidate_url(item_url: str, referer: str, timeout_ms: int) -> 
 
 
 def download_item_via_http(context, item: Dict[str, str], share_url: str, download_dir: Path, title: str, timeout_ms: int):
+    if timeout_ms <= 0:
+        return None, "timeout"
+    deadline_ts = time.monotonic() + (timeout_ms / 1000.0)
     candidate_url, candidate_referer, status = resolve_item_candidate_url(
         item["href"],
         referer=share_url,
-        timeout_ms=timeout_ms,
+        timeout_ms=remaining_timeout_ms(deadline_ts, timeout_ms),
     )
     if not candidate_url:
         return None, status
@@ -1215,26 +1430,31 @@ def download_item_via_http(context, item: Dict[str, str], share_url: str, downlo
         lanrar_candidates.append(candidate_url + "&toolsdown")
 
     for lanrar_url in lanrar_candidates:
+        operation_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+        if operation_timeout_ms <= 0:
+            return None, "timeout"
         final_url = resolve_lanrar_ajax_url(
             lanrar_url,
             referer=candidate_referer or share_url,
-            timeout_ms=timeout_ms,
+            timeout_ms=operation_timeout_ms,
         )
-        if not final_url:
+        if not final_url and timeout_left_ms(deadline_ts) > 0:
             verify_page = None
             try:
                 verify_page = context.new_page()
+                navigation_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+                if navigation_timeout_ms <= 0:
+                    return None, "timeout"
                 verify_page.goto(
                     lanrar_url,
                     referer=candidate_referer or share_url,
                     wait_until="domcontentloaded",
-                    timeout=min(timeout_ms, 45000),
+                    timeout=navigation_timeout_ms,
                 )
-                verify_page.wait_for_timeout(1500)
-                final_url = resolve_browser_download_link(
-                    verify_page,
-                    time.monotonic() + (max(min(timeout_ms, 45000), 5000) / 1000.0),
-                )
+                wait_ms = remaining_timeout_ms(deadline_ts, 1500)
+                if wait_ms > 0:
+                    verify_page.wait_for_timeout(wait_ms)
+                final_url = resolve_browser_download_link(verify_page, deadline_ts)
             except Exception:
                 final_url = None
             finally:
@@ -1245,17 +1465,20 @@ def download_item_via_http(context, item: Dict[str, str], share_url: str, downlo
                         pass
         if not final_url:
             continue
+        operation_timeout_ms = remaining_timeout_ms(deadline_ts, 90000)
+        if operation_timeout_ms <= 0:
+            return None, "timeout"
         downloaded = download_direct_file_via_api_request(
             context.request,
             final_url,
             download_dir=download_dir,
             title=title,
             referer=lanrar_url,
-            timeout_ms=timeout_ms,
+            timeout_ms=operation_timeout_ms,
         )
         if downloaded:
             return downloaded, "ok"
-    return None, "no_download"
+    return None, "timeout" if timeout_left_ms(deadline_ts) <= 0 else "no_download"
 
 
 def download_share_item(page, item: Dict[str, str], share_url: str, download_dir: Path, title: str, deadline_ts: float, timeout_ms: int):
@@ -1270,6 +1493,8 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
     )
     if direct_out:
         return direct_out, "ok"
+    if timeout_left_ms(deadline_ts) <= 0:
+        return None, "timeout"
 
     last_status = direct_status if direct_status and direct_status != "no_download" else "no_download"
     try:
@@ -1277,9 +1502,13 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
             item["href"],
             referer=share_url,
             wait_until="domcontentloaded",
-            timeout=min(timeout_left_ms(deadline_ts), 45000),
+            timeout=max(1, min(timeout_left_ms(deadline_ts), 30000)),
         )
-        page.wait_for_timeout(2000)
+        wait_ms = remaining_timeout_ms(deadline_ts, 2000)
+        if wait_ms > 0:
+            page.wait_for_timeout(wait_ms)
+        if timeout_left_ms(deadline_ts) <= 0:
+            return None, "timeout"
         candidate_urls = collect_page_download_candidates(page)
         try:
             candidate_urls.insert(0, page.url)
@@ -1295,6 +1524,8 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
                 continue
             browser_candidates.append(browser_candidate)
         for browser_candidate in browser_candidates:
+            if timeout_left_ms(deadline_ts) <= 0:
+                return None, "timeout"
             verify_page = None
             try:
                 verify_page = page.context.new_page()
@@ -1302,19 +1533,24 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
                     browser_candidate,
                     referer=page.url,
                     wait_until="domcontentloaded",
-                    timeout=min(timeout_left_ms(deadline_ts), 45000),
+                    timeout=max(1, min(timeout_left_ms(deadline_ts), 30000)),
                 )
-                verify_page.wait_for_timeout(1500)
+                wait_ms = remaining_timeout_ms(deadline_ts, 1500)
+                if wait_ms > 0:
+                    verify_page.wait_for_timeout(wait_ms)
                 browser_final_url = resolve_browser_download_link(verify_page, deadline_ts)
                 if not browser_final_url:
                     continue
+                operation_timeout_ms = remaining_timeout_ms(deadline_ts, timeout_ms)
+                if operation_timeout_ms <= 0:
+                    return None, "timeout"
                 direct_out = download_direct_file_via_api_request(
                     page.context.request,
                     browser_final_url,
                     download_dir=download_dir,
                     title=item_title,
                     referer=verify_page.url,
-                    timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+                    timeout_ms=operation_timeout_ms,
                 )
                 if direct_out:
                     return direct_out, "ok"
@@ -1324,13 +1560,16 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
                         verify_page.close()
                     except Exception:
                         pass
+        operation_timeout_ms = remaining_timeout_ms(deadline_ts, timeout_ms)
+        if operation_timeout_ms <= 0:
+            return None, "timeout"
         direct_candidates = [candidate_url for candidate_url in candidate_urls if candidate_url not in browser_candidates]
         direct_out = download_from_candidate_urls(
             direct_candidates,
             download_dir=download_dir,
             title=item_title,
             referer=page.url,
-            timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+            timeout_ms=operation_timeout_ms,
         )
         if direct_out:
             return direct_out, "ok"
@@ -1341,46 +1580,120 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
         return None, f"exception: {e}"
 
 
-def download_one_lanzou(page, url: str, pwd: str, download_dir: Path, title: str, timeout_ms: int):
-    deadline_ts = time.monotonic() + (max(timeout_ms, 10000) / 1000.0)
-    page.set_default_timeout(min(timeout_ms, 15000))
-    items = pick_share_items(fetch_share_items_via_ajax(url, pwd=pwd, timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms)))
-    if not items:
-        page.goto(url, wait_until="domcontentloaded", timeout=min(timeout_left_ms(deadline_ts), 45000))
+def download_one_lanzou(
+    page,
+    url: str,
+    pwd: str,
+    download_dir: Path,
+    title: str,
+    timeout_ms: int,
+    label: str = "",
+):
+    # Every nested network/browser fallback shares this absolute entry deadline.
+    entry_cap_ms = max(60, int(os.getenv("LANZOU_ENTRY_TIMEOUT_SECONDS", "360"))) * 1000
+    base_cap_ms = min(max(timeout_ms, 10000), 240000, entry_cap_ms)
+    # Will re-scale after we know bundle count; provisional deadline first
+    total_timeout_ms = base_cap_ms
+    deadline_ts = time.monotonic() + (total_timeout_ms / 1000.0)
+    page.set_default_timeout(min(total_timeout_ms, 12000))
+    try:
+        page.set_default_navigation_timeout(min(total_timeout_ms, 30000))
+    except Exception:
+        pass
+    raw_items: List[Dict[str, str]] = fetch_share_items_via_ajax(
+        url, pwd=pwd, timeout_ms=min(timeout_left_ms(deadline_ts), total_timeout_ms)
+    )
+    items = pick_share_items(raw_items)
+    if not items and timeout_left_ms(deadline_ts) > 0:
+        try:
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=max(1, min(timeout_left_ms(deadline_ts), 30000)),
+            )
+        except Exception:
+            pass
         fill_lanzou_password(page, pwd)
-        page.wait_for_timeout(1500)
-        items = pick_share_items(collect_share_items(page))
-    if not items and pwd:
+        wait_ms = min(1500, timeout_left_ms(deadline_ts))
+        if wait_ms > 0:
+            page.wait_for_timeout(wait_ms)
+        raw_items = collect_share_items(page)
+        items = pick_share_items(raw_items)
+    if not items and pwd and timeout_left_ms(deadline_ts) > 0:
         fill_lanzou_password(page, pwd)
-        page.wait_for_timeout(1500)
-        items = pick_share_items(collect_share_items(page))
+        wait_ms = min(1500, timeout_left_ms(deadline_ts))
+        if wait_ms > 0:
+            page.wait_for_timeout(wait_ms)
+        raw_items = collect_share_items(page)
+        items = pick_share_items(raw_items)
     if not items:
         return None, "no_target_item"
 
-    bundle_items = [item for item in items if item["kind"] == "bundle"]
-    target_items = bundle_items or [item for item in items if item["kind"] == "epub"]
-    if not target_items:
-        target_items = items
+    has_bundle = any(i.get("kind") == "bundle" for i in items)
+    if has_bundle:
+        # ALL 合集 (合集1/2/3…); never download single-volume epubs when bundles exist
+        target_items = [i for i in items if i.get("kind") == "bundle"]
+        skipped_singles = sum(1 for i in (raw_items or []) if i.get("kind") == "epub")
+        names = ", ".join((i.get("text") or "?") for i in target_items[:12])
+        log(
+            f"[INFO] 检测到合集 x{len(target_items)}，全部下载、跳过单本"
+            + (f" x{skipped_singles}" if skipped_singles else "")
+            + (f": {names}" if names else "")
+        )
+    else:
+        # No 合集 on share page: fall back to individual epubs (still capped)
+        target_items = [i for i in items if i.get("kind") == "epub"][:8] or items[:1]
+        log(f"[INFO] 未找到合集，回退下载单本 x{len(target_items)}")
+
+    # Extend multi-bundle entries without exceeding the configured entry deadline.
+    if has_bundle and len(target_items) > 1:
+        multi_cap_ms = min(entry_cap_ms, max(base_cap_ms, 180000 * len(target_items)))
+        if multi_cap_ms > total_timeout_ms:
+            extra = (multi_cap_ms - total_timeout_ms) / 1000.0
+            deadline_ts += extra
+            total_timeout_ms = multi_cap_ms
+            log(f"[INFO] 多合集条目，放宽超时至 {total_timeout_ms // 1000}s")
 
     downloaded: List[Path] = []
     last_status = "no_download"
-    for item in target_items:
-        item_deadline_ts = time.monotonic() + (max(timeout_ms, 10000) / 1000.0)
-        out_path, item_status = download_share_item(
-            page=page,
-            item=item,
-            share_url=url,
-            download_dir=download_dir,
-            title=title,
-            deadline_ts=item_deadline_ts,
-            timeout_ms=timeout_ms,
-        )
+    for idx, item in enumerate(target_items):
+        left_ms = timeout_left_ms(deadline_ts)
+        if left_ms <= 0:
+            last_status = "timeout"
+            log(f"[WARN] 蓝奏条目总超时，停止: {title} (已下 {len(downloaded)}/{len(target_items)})")
+            break
+        # Multi-合集 shares need more time per file (large zips)
+        per_item_timeout_ms = min(180000 if item.get("kind") == "bundle" else 90000, left_ms)
+        item_deadline_ts = time.monotonic() + (per_item_timeout_ms / 1000.0)
+        try:
+            out_path, item_status = download_share_item(
+                page=page,
+                item=item,
+                share_url=url,
+                download_dir=download_dir,
+                title=title,
+                deadline_ts=item_deadline_ts,
+                timeout_ms=per_item_timeout_ms,
+            )
+        except Exception as e:
+            out_path, item_status = None, f"exception: {e}"
+            log(f"[WARN] 蓝奏文件异常: {item.get('text', item)} err={e}")
         if out_path:
+            out_path = finalize_download_path(
+                Path(out_path),
+                download_dir,
+                label,
+                original_name=item.get("text") or Path(out_path).name,
+            )
             downloaded.append(out_path)
-            log(f"[INFO] 已下载蓝奏文件: {item['text']} -> {out_path}")
+            log(
+                f"[INFO] 已下载蓝奏文件 ({idx + 1}/{len(target_items)}): "
+                f"{item['text']} -> {out_path}"
+            )
             continue
         if item_status and item_status != "no_download":
             last_status = item_status
+        log(f"[WARN] 蓝奏文件下载失败，继续下一项: {item.get('text', item)} status={item_status}")
 
     if downloaded:
         return downloaded, "ok"
@@ -1504,6 +1817,8 @@ def run(args) -> int:
     labels_state = state.setdefault("labels", {})
     baseline_labels = set(state.setdefault("baseline_labels", []))
     baseline_entries = state.setdefault("baseline_entries", {})
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_orphan_archives(archive_dir, state)
     if not baseline_labels and not args.include_existing:
         baseline_labels = set(load_all_labels(merged_csv_path))
         state["baseline_labels"] = sorted(baseline_labels)
@@ -1519,13 +1834,31 @@ def run(args) -> int:
     skip_cnt = 0
     fail_cnt = 0
 
+    # Whole integrated downloader hard budget (env override allowed)
+    run_budget_s = max(60, int(os.getenv("LANZOU_RUN_TIMEOUT_SECONDS", "600")))
+    run_deadline_ts = time.monotonic() + run_budget_s
+    log(f"[INFO] lanzou downloader budget={run_budget_s}s entries={len(entries)}")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=not args.show_browser,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
         )
         context = browser.new_context(accept_downloads=True)
+        try:
+            context.set_default_timeout(12000)
+            context.set_default_navigation_timeout(30000)
+        except Exception:
+            pass
         for entry in entries:
+            if timeout_left_ms(run_deadline_ts) <= 0:
+                log(f"[WARN] 达到 lanzou 总超时 {run_budget_s}s，提前结束本轮下载")
+                break
             label = entry["label"]
             title = build_entry_title(entry)
             current_signature = build_entry_signature(entry)
@@ -1562,7 +1895,8 @@ def run(args) -> int:
                     pwd=pwd,
                     download_dir=archive_dir,
                     title=title,
-                    timeout_ms=args.timeout_ms,
+                    timeout_ms=min(args.timeout_ms, timeout_left_ms(run_deadline_ts)),
+                    label=label,
                 )
                 if isinstance(download_result, list):
                     downloaded_paths = [Path(p) for p in download_result]
@@ -1595,12 +1929,17 @@ def run(args) -> int:
                     labels_state[label] = make_state_entry(
                         entry=entry,
                         title=title,
-                        archive_path=direct_epubs[0],
-                        archive_paths=direct_epubs,
+                        archive_path=None,
+                        archive_paths=[],
                         epubs=copied,
                         status="direct_epub",
                     )
                     save_state(state_path, state)
+                    # Source files under archives/ are copies; epubs/ holds the keepers
+                    cleanup_local_files(
+                        [p for p in direct_epubs if p.parent.resolve() == archive_dir.resolve()],
+                        reason=f"直接 EPUB 已复制 {label}",
+                    )
                     log(f"[INFO] 完成: {title} 直接下载 EPUB={len(copied)}")
                     ok_cnt += 1
                     continue
@@ -1654,16 +1993,22 @@ def run(args) -> int:
                 fail_cnt += 1
                 continue
 
+            # Keep only epub paths in state; archives are disposable after extract
             labels_state[label] = make_state_entry(
                 entry=entry,
                 title=title,
-                archive_path=archive_paths[0] if archive_paths else (direct_epubs[0] if direct_epubs else None),
-                archive_paths=downloaded_paths,
+                archive_path=None,
+                archive_paths=[],
                 epubs=copied,
                 status="ok",
             )
             save_state(state_path, state)
             shutil.rmtree(extract_dir, ignore_errors=True)
+            # Auto-delete archives (and raw direct sources under archives/) after success
+            to_delete = list(archive_paths) + [
+                p for p in direct_epubs if p.parent.resolve() == archive_dir.resolve()
+            ]
+            cleanup_local_files(to_delete, reason=f"解压完成 {label}")
             log(f"[INFO] 完成: {title} EPUB={len(copied)}")
             ok_cnt += 1
 

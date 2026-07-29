@@ -154,6 +154,17 @@ ONEDRIVE_REMOTE_ROOT=wenku8_od:轻小说
 ONEDRIVE_UPLOAD_INTERVAL_SECONDS=120
 ```
 
+单核 VPS 建议保留默认资源与超时保护：
+
+```bash
+WENKU8_CPU_LIMIT=0.70
+SCRAPE_TIMEOUT_SECONDS=1800
+LANZOU_RUN_TIMEOUT_SECONDS=600
+LANZOU_ENTRY_TIMEOUT_SECONDS=360
+```
+
+蓝奏下载会在独立进程中运行。达到硬超时后，下载器及其 Chromium 子进程会一起终止；Compose 的 CPU 配额可避免异常页面持续占满宿主机单核。
+
 运行模式：
 
 - 容器常驻运行

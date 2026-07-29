@@ -2,6 +2,8 @@ services:
   wenku8:
     image: your-dockerhub-username/wenku8:latest
     container_name: wenku8
+    # Keep Chromium from saturating a single-core VPS during a failed download.
+    cpus: ${WENKU8_CPU_LIMIT:-0.70}
     environment:
       # 必填：wenku8 登录后的整行 Cookie
       WENKU_COOKIES: ${WENKU_COOKIES}
@@ -11,6 +13,10 @@ services:
       SCRAPER: ${SCRAPER:-steel}
       # 6 小时 = 21600 秒
       RUN_INTERVAL_SECONDS: ${RUN_INTERVAL_SECONDS:-21600}
+      # 整轮抓取 30 分钟、蓝奏子进程 10 分钟、单条蓝奏 6 分钟硬上限
+      SCRAPE_TIMEOUT_SECONDS: ${SCRAPE_TIMEOUT_SECONDS:-1800}
+      LANZOU_RUN_TIMEOUT_SECONDS: ${LANZOU_RUN_TIMEOUT_SECONDS:-600}
+      LANZOU_ENTRY_TIMEOUT_SECONDS: ${LANZOU_ENTRY_TIMEOUT_SECONDS:-360}
       # 是否自动下载并提取蓝奏 EPUB（true/false）
       ENABLE_LANZOU_DOWNLOAD: ${ENABLE_LANZOU_DOWNLOAD:-true}
       # 是否自动上传到 OneDrive，并在确认上传成功后删除本地 EPUB/压缩包
