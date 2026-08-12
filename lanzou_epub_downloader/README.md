@@ -269,6 +269,7 @@ python -m lanzou_epub_downloader.onedrive_sync
 - 如果没有合集，则会回退到下载单卷 `.epub`
 - 会自动过滤 `zht_` 前缀或“繁体”命名的 EPUB，不会保存到 `epubs/`
 - 首次部署只建立基线，不会回补部署前已有的历史条目
+- 蓝奏页面 `page.goto` 默认允许 90s，并会自动重试；可用 `LANZOU_NAV_TIMEOUT_MS` / `LANZOU_NAV_RETRIES` / `LANZOU_ITEM_RETRIES` 调整
 - 最终文件下载使用 Playwright 的 `APIRequestContext`，在 VPS 上比直接 `requests` 更稳定
 - `zip` 直接用 Python 标准库解压
 - `7z` / `rar` 依赖容器内安装的 `7z`

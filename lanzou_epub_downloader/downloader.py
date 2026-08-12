@@ -331,6 +331,27 @@ def remaining_timeout_ms(deadline_ts: float, cap_ms: int) -> int:
     return min(timeout_left_ms(deadline_ts), max(0, int(cap_ms)))
 
 
+def navigation_timeout_cap_ms() -> int:
+    """Max Playwright navigation budget for a single goto attempt.
+
+    Lanzou (and CDN frontends) often need >30s from a 1-core VPS; the old hard
+    30s cap produced repeated `Page.goto: Timeout 30000ms exceeded` failures.
+    """
+    try:
+        value = int(os.getenv("LANZOU_NAV_TIMEOUT_MS", "90000"))
+    except (TypeError, ValueError):
+        value = 90000
+    return max(15000, min(value, 180000))
+
+
+def navigation_timeout_ms(deadline_ts: float, cap_ms: Optional[int] = None) -> int:
+    """Navigation timeout clamped by both the entry deadline and nav cap."""
+    return remaining_timeout_ms(
+        deadline_ts,
+        navigation_timeout_cap_ms() if cap_ms is None else max(0, int(cap_ms)),
+    )
+
+
 def is_target_closed_error(err) -> bool:
     msg = str(err).lower()
     return (
@@ -338,6 +359,123 @@ def is_target_closed_error(err) -> bool:
         or ("context or browser has been closed" in msg)
         or ("target closed" in msg)
     )
+
+
+def is_navigation_timeout_error(err) -> bool:
+    msg = str(err).lower()
+    return ("timeout" in msg and ("goto" in msg or "navigation" in msg or "page.goto" in msg)) or (
+        "exceeded" in msg and "timeout" in msg
+    )
+
+
+def page_looks_loaded(page) -> bool:
+    """Best-effort check that a timed-out navigation still produced a usable page."""
+    try:
+        url = (page.url or "").strip().lower()
+    except Exception:
+        url = ""
+    if url and url not in {"about:blank", "chrome-error://chromewebdata/"}:
+        try:
+            content = page.content()
+        except Exception:
+            content = ""
+        if content and len(content) > 200:
+            return True
+    return False
+
+
+def safe_page_goto(
+    page,
+    url: str,
+    *,
+    deadline_ts: float,
+    referer: Optional[str] = None,
+    max_attempts: Optional[int] = None,
+    label: str = "",
+) -> bool:
+    """Navigate with retries, progressive wait_until, and deadline-aware timeouts.
+
+    Returns True when the page is usable (even if a later wait_until timed out
+    after partial load). Returns False when all attempts fail before deadline.
+    """
+    if not url or timeout_left_ms(deadline_ts) <= 0:
+        return False
+    try:
+        attempts = int(os.getenv("LANZOU_NAV_RETRIES", "3")) if max_attempts is None else int(max_attempts)
+    except (TypeError, ValueError):
+        attempts = 3
+    attempts = max(1, min(attempts, 5))
+
+    # commit fires earlier than domcontentloaded; use it first under pressure.
+    wait_strategies = ("commit", "domcontentloaded")
+    last_err: Optional[BaseException] = None
+    tag = f" {label}" if label else ""
+
+    for attempt in range(1, attempts + 1):
+        left = timeout_left_ms(deadline_ts)
+        if left <= 0:
+            break
+        wait_until = wait_strategies[(attempt - 1) % len(wait_strategies)]
+        # Leave a little budget for post-nav work; never below 5s when possible.
+        nav_timeout = navigation_timeout_ms(deadline_ts)
+        if nav_timeout < 1000:
+            break
+        kwargs = {
+            "wait_until": wait_until,
+            "timeout": nav_timeout,
+        }
+        if referer:
+            kwargs["referer"] = referer
+        try:
+            page.goto(url, **kwargs)
+            return True
+        except Exception as e:
+            last_err = e
+            if is_target_closed_error(e):
+                raise
+            usable = page_looks_loaded(page)
+            if usable:
+                log(
+                    f"[WARN] page.goto partial load accepted{tag} "
+                    f"attempt={attempt}/{attempts} wait_until={wait_until}: {e}"
+                )
+                return True
+            if not is_navigation_timeout_error(e) and "net::" not in str(e).lower():
+                # Non-timeout hard error: one quick retry only if budget remains.
+                if attempt >= attempts:
+                    break
+            log(
+                f"[WARN] page.goto failed{tag} attempt={attempt}/{attempts} "
+                f"wait_until={wait_until} timeout_ms={nav_timeout}: {e}"
+            )
+            # Brief backoff before retry; keep it small vs. remaining deadline.
+            backoff = min(1500 * attempt, max(0, timeout_left_ms(deadline_ts) // 4), 4000)
+            if backoff > 0:
+                try:
+                    page.wait_for_timeout(backoff)
+                except Exception:
+                    time.sleep(backoff / 1000.0)
+
+    if last_err is not None:
+        log(f"[WARN] page.goto exhausted retries{tag}: {last_err}")
+    return False
+
+
+def item_download_retries() -> int:
+    try:
+        value = int(os.getenv("LANZOU_ITEM_RETRIES", "2"))
+    except (TypeError, ValueError):
+        value = 2
+    return max(1, min(value, 4))
+
+
+def is_retryable_item_status(status: Optional[str]) -> bool:
+    if not status:
+        return True
+    value = status.lower()
+    if value in {"no_download", "nav_timeout", "timeout", "target_closed"}:
+        return True
+    return "timeout" in value or "goto" in value or value.startswith("exception:")
 
 
 def normalize_candidate_url(raw: str, base_url: str) -> Optional[str]:
@@ -1148,7 +1286,14 @@ def pick_share_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 def open_share_item_page(context, item: Dict[str, str], timeout_ms: int):
     page = context.new_page()
-    page.goto(item["href"], wait_until="domcontentloaded", timeout=min(timeout_ms, 45000))
+    deadline_ts = time.monotonic() + (max(int(timeout_ms), 1) / 1000.0)
+    if not safe_page_goto(
+        page,
+        item["href"],
+        deadline_ts=deadline_ts,
+        label=item.get("text") or "",
+    ):
+        raise RuntimeError(f"page.goto failed: {item.get('href')}")
     return page
 
 
@@ -1451,19 +1596,17 @@ def download_item_via_http(context, item: Dict[str, str], share_url: str, downlo
             verify_page = None
             try:
                 verify_page = context.new_page()
-                navigation_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
-                if navigation_timeout_ms <= 0:
-                    return None, "timeout"
-                verify_page.goto(
+                if safe_page_goto(
+                    verify_page,
                     lanrar_url,
+                    deadline_ts=deadline_ts,
                     referer=candidate_referer or share_url,
-                    wait_until="domcontentloaded",
-                    timeout=navigation_timeout_ms,
-                )
-                wait_ms = remaining_timeout_ms(deadline_ts, 1500)
-                if wait_ms > 0:
-                    verify_page.wait_for_timeout(wait_ms)
-                final_url = resolve_browser_download_link(verify_page, deadline_ts)
+                    label="lanrar-verify",
+                ):
+                    wait_ms = remaining_timeout_ms(deadline_ts, 1500)
+                    if wait_ms > 0:
+                        verify_page.wait_for_timeout(wait_ms)
+                    final_url = resolve_browser_download_link(verify_page, deadline_ts)
             except Exception:
                 final_url = None
             finally:
@@ -1492,13 +1635,17 @@ def download_item_via_http(context, item: Dict[str, str], share_url: str, downlo
 
 def download_share_item(page, item: Dict[str, str], share_url: str, download_dir: Path, title: str, deadline_ts: float, timeout_ms: int):
     item_title = item["text"] if item["kind"] == "epub" else title
+    remaining = min(timeout_left_ms(deadline_ts), timeout_ms)
+    # Keep budget for the browser fallback; HTTP often fails quickly on flaky shares.
+    reserve_browser_ms = min(45000, remaining // 2) if remaining > 25000 else 0
+    http_budget = remaining - reserve_browser_ms
     direct_out, direct_status = download_item_via_http(
         page.context,
         item=item,
         share_url=share_url,
         download_dir=download_dir,
         title=item_title,
-        timeout_ms=min(timeout_left_ms(deadline_ts), timeout_ms),
+        timeout_ms=http_budget,
     )
     if direct_out:
         return direct_out, "ok"
@@ -1506,25 +1653,43 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
         return None, "timeout"
 
     last_status = direct_status if direct_status and direct_status != "no_download" else "no_download"
+    work_page = page
+    created_page = False
     try:
-        page.goto(
+        if not safe_page_goto(
+            work_page,
             item["href"],
+            deadline_ts=deadline_ts,
             referer=share_url,
-            wait_until="domcontentloaded",
-            timeout=max(1, min(timeout_left_ms(deadline_ts), 30000)),
-        )
+            label=item_title,
+        ):
+            if timeout_left_ms(deadline_ts) <= 0:
+                return None, "timeout"
+            try:
+                work_page = page.context.new_page()
+                created_page = True
+            except Exception:
+                return None, last_status or "nav_timeout"
+            if not safe_page_goto(
+                work_page,
+                item["href"],
+                deadline_ts=deadline_ts,
+                referer=share_url,
+                label=f"{item_title} (fresh page)",
+            ):
+                return None, "nav_timeout"
         wait_ms = remaining_timeout_ms(deadline_ts, 2000)
         if wait_ms > 0:
-            page.wait_for_timeout(wait_ms)
+            work_page.wait_for_timeout(wait_ms)
         if timeout_left_ms(deadline_ts) <= 0:
             return None, "timeout"
-        candidate_urls = collect_page_download_candidates(page)
+        candidate_urls = collect_page_download_candidates(work_page)
         try:
-            candidate_urls.insert(0, page.url)
+            candidate_urls.insert(0, work_page.url)
         except Exception:
             pass
         browser_candidates = []
-        for browser_candidate in [page.url] + candidate_urls:
+        for browser_candidate in [work_page.url] + candidate_urls:
             if not is_lanrar_file_page(browser_candidate):
                 continue
             if "toolsdown" not in browser_candidate.lower():
@@ -1538,12 +1703,14 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
             verify_page = None
             try:
                 verify_page = page.context.new_page()
-                verify_page.goto(
+                if not safe_page_goto(
+                    verify_page,
                     browser_candidate,
-                    referer=page.url,
-                    wait_until="domcontentloaded",
-                    timeout=max(1, min(timeout_left_ms(deadline_ts), 30000)),
-                )
+                    deadline_ts=deadline_ts,
+                    referer=work_page.url,
+                    label="item-verify",
+                ):
+                    continue
                 wait_ms = remaining_timeout_ms(deadline_ts, 1500)
                 if wait_ms > 0:
                     verify_page.wait_for_timeout(wait_ms)
@@ -1577,7 +1744,7 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
             direct_candidates,
             download_dir=download_dir,
             title=item_title,
-            referer=page.url,
+            referer=work_page.url,
             timeout_ms=operation_timeout_ms,
         )
         if direct_out:
@@ -1587,6 +1754,12 @@ def download_share_item(page, item: Dict[str, str], share_url: str, download_dir
         if is_target_closed_error(e):
             return None, "target_closed"
         return None, f"exception: {e}"
+    finally:
+        if created_page:
+            try:
+                work_page.close()
+            except Exception:
+                pass
 
 
 def download_one_lanzou(
@@ -1606,7 +1779,7 @@ def download_one_lanzou(
     deadline_ts = time.monotonic() + (total_timeout_ms / 1000.0)
     page.set_default_timeout(min(total_timeout_ms, 12000))
     try:
-        page.set_default_navigation_timeout(min(total_timeout_ms, 30000))
+        page.set_default_navigation_timeout(min(total_timeout_ms, navigation_timeout_cap_ms()))
     except Exception:
         pass
     raw_items: List[Dict[str, str]] = fetch_share_items_via_ajax(
@@ -1614,14 +1787,7 @@ def download_one_lanzou(
     )
     items = pick_share_items(raw_items)
     if not items and timeout_left_ms(deadline_ts) > 0:
-        try:
-            page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=max(1, min(timeout_left_ms(deadline_ts), 30000)),
-            )
-        except Exception:
-            pass
+        safe_page_goto(page, url, deadline_ts=deadline_ts, label="share")
         fill_lanzou_password(page, pwd)
         wait_ms = min(1500, timeout_left_ms(deadline_ts))
         if wait_ms > 0:
@@ -1665,28 +1831,45 @@ def download_one_lanzou(
 
     downloaded: List[Path] = []
     last_status = "no_download"
+    item_retries = item_download_retries()
     for idx, item in enumerate(target_items):
-        left_ms = timeout_left_ms(deadline_ts)
-        if left_ms <= 0:
-            last_status = "timeout"
-            log(f"[WARN] 蓝奏条目总超时，停止: {title} (已下 {len(downloaded)}/{len(target_items)})")
+        out_path = None
+        item_status = "no_download"
+        for attempt in range(1, item_retries + 1):
+            left_ms = timeout_left_ms(deadline_ts)
+            if left_ms <= 0:
+                last_status = "timeout"
+                log(f"[WARN] 蓝奏条目总超时，停止: {title} (已下 {len(downloaded)}/{len(target_items)})")
+                break
+            # Multi-合集 shares need more time per file (large zips)
+            per_item_timeout_ms = min(180000 if item.get("kind") == "bundle" else 90000, left_ms)
+            item_deadline_ts = time.monotonic() + (per_item_timeout_ms / 1000.0)
+            try:
+                out_path, item_status = download_share_item(
+                    page=page,
+                    item=item,
+                    share_url=url,
+                    download_dir=download_dir,
+                    title=title,
+                    deadline_ts=item_deadline_ts,
+                    timeout_ms=per_item_timeout_ms,
+                )
+            except Exception as e:
+                out_path, item_status = None, f"exception: {e}"
+                log(f"[WARN] 蓝奏文件异常: {item.get('text', item)} err={e}")
+            if out_path:
+                break
+            if (
+                attempt < item_retries
+                and is_retryable_item_status(item_status)
+                and timeout_left_ms(deadline_ts) > 0
+            ):
+                log(
+                    f"[WARN] 蓝奏文件将重试 ({attempt}/{item_retries}): "
+                    f"{item.get('text', item)} status={item_status}"
+                )
+                continue
             break
-        # Multi-合集 shares need more time per file (large zips)
-        per_item_timeout_ms = min(180000 if item.get("kind") == "bundle" else 90000, left_ms)
-        item_deadline_ts = time.monotonic() + (per_item_timeout_ms / 1000.0)
-        try:
-            out_path, item_status = download_share_item(
-                page=page,
-                item=item,
-                share_url=url,
-                download_dir=download_dir,
-                title=title,
-                deadline_ts=item_deadline_ts,
-                timeout_ms=per_item_timeout_ms,
-            )
-        except Exception as e:
-            out_path, item_status = None, f"exception: {e}"
-            log(f"[WARN] 蓝奏文件异常: {item.get('text', item)} err={e}")
         if out_path:
             out_path = finalize_download_path(
                 Path(out_path),
@@ -1700,9 +1883,12 @@ def download_one_lanzou(
                 f"{item['text']} -> {out_path}"
             )
             continue
-        if item_status and item_status != "no_download":
-            last_status = item_status
-        log(f"[WARN] 蓝奏文件下载失败，继续下一项: {item.get('text', item)} status={item_status}")
+        if last_status != "timeout":
+            if item_status and item_status != "no_download":
+                last_status = item_status
+            log(f"[WARN] 蓝奏文件下载失败，继续下一项: {item.get('text', item)} status={item_status}")
+        if last_status == "timeout":
+            break
 
     if downloaded:
         return downloaded, "ok"
@@ -1861,7 +2047,7 @@ def run(args) -> int:
         context = browser.new_context(accept_downloads=True)
         try:
             context.set_default_timeout(12000)
-            context.set_default_navigation_timeout(30000)
+            context.set_default_navigation_timeout(navigation_timeout_cap_ms())
         except Exception:
             pass
         for entry in entries:

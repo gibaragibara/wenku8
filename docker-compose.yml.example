@@ -22,6 +22,10 @@ services:
       LANZOU_ENTRY_TIMEOUT_SECONDS: ${LANZOU_ENTRY_TIMEOUT_SECONDS:-360}
       # Stream archives to disk and reject a single response above 2 GiB.
       LANZOU_MAX_DOWNLOAD_BYTES: ${LANZOU_MAX_DOWNLOAD_BYTES:-2147483648}
+      # Lanzou page.goto often exceeds 30s from a 1-core VPS; retry instead of failing the book.
+      LANZOU_NAV_TIMEOUT_MS: ${LANZOU_NAV_TIMEOUT_MS:-90000}
+      LANZOU_NAV_RETRIES: ${LANZOU_NAV_RETRIES:-3}
+      LANZOU_ITEM_RETRIES: ${LANZOU_ITEM_RETRIES:-2}
       # 是否自动下载并提取蓝奏 EPUB（true/false）
       ENABLE_LANZOU_DOWNLOAD: ${ENABLE_LANZOU_DOWNLOAD:-true}
       # 是否自动上传到 OneDrive，并在确认上传成功后删除本地 EPUB/压缩包

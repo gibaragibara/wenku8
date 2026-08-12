@@ -91,6 +91,83 @@ class DownloaderHelpersTest(unittest.TestCase):
             self.assertEqual(response.assert_chunk_size, 65536)
             self.assertEqual(list(Path(tmp).glob("*.part")), [])
 
+    def test_navigation_timeout_cap_defaults_and_clamps(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LANZOU_NAV_TIMEOUT_MS", None)
+            self.assertEqual(downloader.navigation_timeout_cap_ms(), 90000)
+        with mock.patch.dict(os.environ, {"LANZOU_NAV_TIMEOUT_MS": "5000"}):
+            self.assertEqual(downloader.navigation_timeout_cap_ms(), 15000)
+        with mock.patch.dict(os.environ, {"LANZOU_NAV_TIMEOUT_MS": "999999"}):
+            self.assertEqual(downloader.navigation_timeout_cap_ms(), 180000)
+
+    def test_navigation_timeout_error_detection(self):
+        self.assertTrue(
+            downloader.is_navigation_timeout_error(
+                Exception("Page.goto: Timeout 30000ms exceeded.")
+            )
+        )
+        self.assertFalse(downloader.is_navigation_timeout_error(Exception("no iframe")))
+
+    def test_retryable_item_status(self):
+        self.assertTrue(downloader.is_retryable_item_status("no_download"))
+        self.assertTrue(downloader.is_retryable_item_status("nav_timeout"))
+        self.assertTrue(
+            downloader.is_retryable_item_status(
+                "exception: Page.goto: Timeout 30000ms exceeded."
+            )
+        )
+        self.assertFalse(downloader.is_retryable_item_status("skip_zht_epub"))
+
+    def test_safe_page_goto_retries_then_succeeds(self):
+        page = mock.Mock()
+        page.url = "about:blank"
+        page.content.return_value = ""
+        page.goto.side_effect = [
+            Exception("Page.goto: Timeout 30000ms exceeded."),
+            None,
+        ]
+        deadline = time.monotonic() + 30
+
+        with mock.patch.dict(os.environ, {"LANZOU_NAV_RETRIES": "3", "LANZOU_NAV_TIMEOUT_MS": "20000"}):
+            ok = downloader.safe_page_goto(
+                page,
+                "https://wenku8.lanzov.com/b00g4erhgb",
+                deadline_ts=deadline,
+                label="test",
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(page.goto.call_count, 2)
+
+    def test_safe_page_goto_accepts_partial_load(self):
+        page = mock.Mock()
+        page.url = "https://wenku8.lanzov.com/b00g4erhgb"
+        page.content.return_value = "<html>" + ("x" * 250)
+        page.goto.side_effect = Exception("Page.goto: Timeout 30000ms exceeded.")
+        deadline = time.monotonic() + 30
+
+        ok = downloader.safe_page_goto(
+            page,
+            "https://wenku8.lanzov.com/b00g4erhgb",
+            deadline_ts=deadline,
+            max_attempts=1,
+        )
+
+        self.assertTrue(ok)
+
+    def test_safe_page_goto_gives_up_when_deadline_expired(self):
+        page = mock.Mock()
+        page.goto = mock.Mock()
+
+        ok = downloader.safe_page_goto(
+            page,
+            "https://example.test",
+            deadline_ts=time.monotonic() - 1,
+        )
+
+        self.assertFalse(ok)
+        page.goto.assert_not_called()
+
     def test_direct_download_rejects_oversize_response(self):
         response = mock.Mock()
         response.status_code = 200
