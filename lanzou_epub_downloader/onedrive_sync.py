@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
+from lanzou_epub_downloader.downloader import strip_label_prefix
+
 
 def read_bool_env(key: str, default: bool) -> bool:
     raw = os.getenv(key)
@@ -100,7 +102,7 @@ def ensure_organized_tree(state: Dict[str, dict], label_to_main: Dict[str, str])
             src = Path(epub_raw)
             if not src.exists():
                 continue
-            dst = folder / src.name
+            dst = folder / strip_label_prefix(src.name, label)
             if dst.exists():
                 continue
             try:
@@ -257,12 +259,14 @@ def prune_local(state: Dict[str, dict], label_to_main: Dict[str, str], remote_ma
         for src in local_epubs:
             if not src.exists():
                 continue
-            rel = f"{folder_name}/{src.name}"
-            remote_size = remote_map.get(rel)
+            dest_name = strip_label_prefix(src.name, label)
+            remote_size = remote_map.get(f"{folder_name}/{dest_name}")
+            if remote_size is None:
+                remote_size = remote_map.get(f"{folder_name}/{src.name}")
             if remote_size is None or remote_size != src.stat().st_size:
                 checks = []
                 break
-            checks.append((src, ORGANIZED_DIR / folder_name / src.name))
+            checks.append((src, ORGANIZED_DIR / folder_name / dest_name))
 
         if not checks:
             continue

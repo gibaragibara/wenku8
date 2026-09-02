@@ -41,6 +41,54 @@ class DownloaderHelpersTest(unittest.TestCase):
             "share123_bundle1.zip",
         )
 
+    def test_strip_label_prefix_from_direct_epub_names(self):
+        self.assertEqual(
+            downloader.strip_label_prefix(
+                "b00g4erhgb_不过是偶像！～但是果然颜值好高～ - 01.epub",
+                "b00g4erhgb",
+            ),
+            "不过是偶像！～但是果然颜值好高～ - 01.epub",
+        )
+        self.assertEqual(
+            downloader.strip_label_prefix("国王游戏 - 01.epub", "b00g4e1g7a"),
+            "国王游戏 - 01.epub",
+        )
+        self.assertEqual(
+            downloader.strip_label_prefix("b04emipfe_药师少女的独语 - 16.epub"),
+            "药师少女的独语 - 16.epub",
+        )
+
+    def test_copy_epubs_to_output_drops_share_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "archives"
+            dst_dir = Path(tmp) / "epubs"
+            src_dir.mkdir()
+            src = src_dir / "b00g4euhdg_M学园 冴岛真纪想回去 - 01.epub"
+            src.write_bytes(b"epub")
+
+            copied = downloader.copy_epubs_to_output(
+                [src], dst_dir, label="b00g4euhdg"
+            )
+
+            self.assertEqual(len(copied), 1)
+            self.assertEqual(copied[0].name, "M学园 冴岛真纪想回去 - 01.epub")
+
+    def test_finalize_download_path_does_not_prefix_epubs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = Path(tmp)
+            src = download_dir / "不过是偶像！～但是果然颜值好高～ - 01.epub"
+            src.write_bytes(b"epub")
+
+            out = downloader.finalize_download_path(
+                src,
+                download_dir,
+                "b00g4erhgb",
+                original_name="不过是偶像！～但是果然颜值好高～ - 01.epub",
+            )
+
+            self.assertEqual(out.name, "不过是偶像！～但是果然颜值好高～ - 01.epub")
+            self.assertTrue(out.exists())
+
     def test_cleanup_orphan_archives_preserves_state_references(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_dir = Path(tmp)

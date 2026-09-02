@@ -84,6 +84,28 @@ def is_generic_bundle_name(name: str) -> bool:
     return stem == "合集" or stem.startswith("合集_") or stem in {"collection", "bundle", "pack"}
 
 
+LANZOU_LABEL_PREFIX_RE = re.compile(r"^(b[0-9a-z]{6,})_(.+\.epub)$", re.IGNORECASE)
+
+
+def strip_label_prefix(filename: str, label: str = "") -> str:
+    """Drop the share-id prefix from a final EPUB name.
+
+    Archives may be stored as `{label}_合集.zip` to avoid collisions, but the
+    EPUB copied to epubs/ and uploaded to OneDrive must keep the original title.
+    """
+    name = Path(filename or "").name
+    if not name:
+        return filename
+    if label:
+        prefix = f"{safe_filename(label)}_"
+        if name.startswith(prefix) and name[len(prefix) :]:
+            return name[len(prefix) :]
+    matched = LANZOU_LABEL_PREFIX_RE.match(name)
+    if matched:
+        return matched.group(2)
+    return name
+
+
 def archive_name_for_label(label: str, original_name: str) -> str:
     """Stable name per (label, 合集序号): b04euduna_合集1.zip / b04euduna_合集2.zip."""
     label_safe = safe_filename(label or "unknown")
@@ -102,8 +124,15 @@ def finalize_download_path(
     label: str,
     original_name: str = "",
 ) -> Path:
-    """Rename download to {label}_{合集N}.zip so multi-bundle shares don't collide."""
+    """Rename archive downloads to {label}_{合集N}.zip so shares don't collide.
+
+    Direct EPUB files keep their original title — the share-id prefix must not
+    leak into epubs/ or OneDrive.
+    """
     if not path or not path.exists():
+        return path
+    suffix = path.suffix.lower()
+    if suffix == ".epub":
         return path
     label = (label or "").strip()
     if not label:
@@ -1932,13 +1961,18 @@ def extract_archive(archive_path: Path, extract_dir: Path) -> List[Path]:
     return collect_epubs(extract_dir)
 
 
-def copy_epubs_to_output(extracted_epubs: Iterable[Path], epub_output_dir: Path) -> List[Path]:
+def copy_epubs_to_output(
+    extracted_epubs: Iterable[Path],
+    epub_output_dir: Path,
+    label: str = "",
+) -> List[Path]:
     epub_output_dir.mkdir(parents=True, exist_ok=True)
     saved: List[Path] = []
     for src in extracted_epubs:
         if is_zht_name(src.name):
             continue
-        target = unique_path(epub_output_dir, safe_filename(src.name))
+        output_name = safe_filename(strip_label_prefix(src.name, label))
+        target = unique_path(epub_output_dir, output_name)
         shutil.copy2(src, target)
         saved.append(target)
     return saved
@@ -2119,7 +2153,7 @@ def run(args) -> int:
                 skipped_zht = len(direct_epubs) - len(usable_epubs)
                 if skipped_zht:
                     log(f"[INFO] 跳过繁体 EPUB={skipped_zht}")
-                copied.extend(copy_epubs_to_output(usable_epubs, epub_dir))
+                copied.extend(copy_epubs_to_output(usable_epubs, epub_dir, label=label))
                 if copied and not archive_paths:
                     labels_state[label] = make_state_entry(
                         entry=entry,
@@ -2159,7 +2193,7 @@ def run(args) -> int:
                     for archive_path in archive_paths:
                         item_extract_dir = extract_dir / safe_filename(archive_path.stem)
                         extracted = extract_archive(archive_path, item_extract_dir)
-                        copied.extend(copy_epubs_to_output(extracted, epub_dir))
+                        copied.extend(copy_epubs_to_output(extracted, epub_dir, label=label))
                 except Exception as e:
                     log(f"[WARN] 压缩包已下载，但提取失败: {archive_paths} err={e}")
                     labels_state[label] = make_state_entry(
