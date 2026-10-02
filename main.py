@@ -335,20 +335,30 @@ def build_url_with_params(base_url: str, params: dict):
 
 # ========== Scraping ==========
 last_page = 1
-def get_latest_url(post_link: str):
-    txt = scrape_page(post_link)
-
+def extract_latest_list_url(html: str):
+    """Pull the master download-list URL out of one review post."""
+    if not html:
+        return None
     # <a href="https://paste.gentoo.zip" target="_blank">https://paste.gentoo.zip</a>/EsX5Kx8V
-    match = re.search(r'<a href="([^"]+)" target="_blank">([^<]+)</a>(/[^<]+)', txt)
-    link = match.group(1) + match.group(3) if match else None
-    if link is None:
-        # <a href="https://0x0.st/8QWZ.txt" target="_blank">https://0x0.st/8QWZ.txt</a><br>
-        match = re.search(r'https:\/\/[^"]+?\.txt(?=")', txt)
-        if match:
-            link = match.group(0)
-        else:
-            raise ValueError("[ERROR] Failed to find the latest URL")
+    match = re.search(r'<a href="([^"]+)" target="_blank">([^<]+)</a>(/[^<]+)', html)
+    if match:
+        return match.group(1) + match.group(3)
+    # <a href="https://0x0.st/8QWZ.txt" target="_blank">https://0x0.st/8QWZ.txt</a><br>
+    match = re.search(r'https://[^"\s]+?\.txt(?=")', html)
+    if match:
+        return match.group(0)
+    return None
 
+def is_epub_share_html(html: str) -> bool:
+    """EPUB shares are not always titled with an ' epub' suffix."""
+    if extract_latest_list_url(html):
+        return True
+    return '最新的 epub' in (html or '')
+
+def get_latest_url(post_link: str):
+    link = extract_latest_list_url(scrape_page(post_link))
+    if link is None:
+        raise ValueError("[ERROR] Failed to find the latest URL")
     return link
 
 def get_latest(url: str):
@@ -380,6 +390,61 @@ def get_latest(url: str):
 
     with open(DL_FILE, 'w', encoding='utf-8') as f:
         f.write(txt)
+
+def normalize_novel_title(novel_title: str, novel_link: str, flg) -> str:
+    if not flg[0] and novel_link.endswith('/2751.htm'):
+        novel_title = '我们不可能成为恋人！绝对不行。（※似乎可行？）(我怎么可能成为你的恋人，不行不行！)'
+        flg[0] = True
+    if not flg[1] and novel_link.endswith('/3828.htm'):
+        novel_title = 'Tier1姐妹 有名四姐妹没我就活不下去'
+        flg[1] = True
+    return novel_title
+
+def collect_review_entries(rows, *, page_num, latest_post_link, fetch_post, refresh_list):
+    """Turn one review page into catalog rows and refresh dl.txt once.
+
+    rows are dicts with raw_title, post_link, novel_title, novel_link.
+    On page 1 the master list is refreshed from the newest EPUB share, including
+    posts whose title does not end with ' epub' and posts already in post_list.
+    Returns (entries, stopped_at_known_post).
+    """
+    entries = []
+    dl_refreshed = False
+    title_flg = [False, False]
+    for row in rows:
+        raw_title = (row.get('raw_title') or '').strip()
+        post_link = row.get('post_link') or ''
+        if not raw_title or not post_link:
+            continue
+        marked = raw_title.endswith(' epub')
+        list_url = None
+        is_epub = marked
+        # Page 1 has to open the newest share even when this post is already
+        # recorded, because the paste file is updated in place.
+        if page_num == 1 and (not marked or not dl_refreshed):
+            html = fetch_post(post_link)
+            list_url = extract_latest_list_url(html)
+            if not marked:
+                is_epub = is_epub_share_html(html)
+        if not is_epub:
+            continue
+        if page_num == 1 and not dl_refreshed and list_url:
+            print(f'[INFO] Refreshing download list from {post_link}')
+            refresh_list(list_url)
+            dl_refreshed = True
+        elif page_num == 1 and not dl_refreshed and marked:
+            print(f'[WARN] EPUB post has no download list URL, trying the next post: {post_link}')
+        if latest_post_link is not None and post_link == latest_post_link:
+            return entries, True
+        if not marked:
+            print(f'[INFO] EPUB share without title suffix: {raw_title} ({post_link})')
+        post_title = raw_title[:-5] if marked else raw_title
+        novel_title = normalize_novel_title(row.get('novel_title') or '', row.get('novel_link') or '', title_flg)
+        novel_link = row.get('novel_link') or ''
+        entries.append(['"' + post_title + '"', post_link, '"' + novel_title + '"', novel_link])
+    if page_num == 1 and not dl_refreshed:
+        print('[WARN] Page 1 had no EPUB share with a download list URL')
+    return entries, False
 
 def parse_page(page_num: int, latest_post_link: str = None):
     params['page'] = page_num
@@ -414,40 +479,32 @@ def parse_page(page_num: int, latest_post_link: str = None):
         raise RuntimeError(f'[ERROR] unexpected page structure, debug saved: {debug_html}, title={page_title}')
 
     rows = table.find_all('tr')[1:]  # skip header row
-
-    flg = [False] * 2
-    entries = []
-    for (i, tr) in enumerate(rows):
+    parsed_rows = []
+    for tr in rows:
         cols = tr.find_all('td')
         if len(cols) < 2:
             continue
         a_post = cols[0].find('a')
-        raw_title = a_post.text.strip()
-        if not raw_title.endswith(' epub'):
-            continue
-        post_title = raw_title[:-5] if raw_title.endswith(' epub') else raw_title
-        post_link = a_post['href'] if a_post['href'].startswith('http') else urljoin(DOMAIN, a_post['href'])
-
-        # 检查是否解析到已存在的最新帖子
-        if latest_post_link is not None and post_link == latest_post_link:
-            return entries, True  # 返回当前已收集的entries，并标记停止
-
         a_novel = cols[1].find('a')
-        novel_title = a_novel.text.strip()
-        novel_link = urljoin(DOMAIN, a_novel['href'])
-        if not flg[0] and novel_link.endswith('/2751.htm'):
-            novel_title = '我们不可能成为恋人！绝对不行。（※似乎可行？）(我怎么可能成为你的恋人，不行不行！)'
-            flg[0] = True
-        if not flg[1] and novel_link.endswith('/3828.htm'):
-            novel_title = 'Tier1姐妹 有名四姐妹没我就活不下去'
-            flg[1] = True
-
-        post_title = '"' + post_title + '"'
-        novel_title = '"' + novel_title + '"'
-        entries.append([post_title, post_link, novel_title, novel_link])
-
-        if page_num == 1 and i == 0:
-            get_latest(get_latest_url(post_link))
+        if a_post is None or a_novel is None or not a_post.get('href'):
+            continue
+        post_link = a_post['href'] if a_post['href'].startswith('http') else urljoin(DOMAIN, a_post['href'])
+        novel_link = a_novel['href'] if a_novel['href'].startswith('http') else urljoin(DOMAIN, a_novel['href'])
+        parsed_rows.append({
+            'raw_title': a_post.get_text(strip=True),
+            'post_link': post_link,
+            'novel_title': a_novel.get_text(strip=True),
+            'novel_link': novel_link,
+        })
+    entries, found = collect_review_entries(
+        parsed_rows,
+        page_num=page_num,
+        latest_post_link=latest_post_link,
+        fetch_post=scrape_page,
+        refresh_list=get_latest,
+    )
+    if found:
+        return entries, True
 
     if page_num == 1:
         last = soup.find('a', class_='last')
