@@ -380,13 +380,14 @@ def get_latest(url: str):
             flg[3] = True
     
     txt = '\n'.join(lines)
-    # if the content has not changed, exit
     if os.path.exists(DL_FILE):
         with open(DL_FILE, 'r', encoding='utf-8') as f:
             old_txt = f.read()
         if old_txt == txt:
-            print('[INFO] Exiting, no update found.')
-            sys.exit(0)
+            # Keep going so a previously failed share is retried. Leaving here
+            # used to skip the downloader until the paste text changed.
+            print('[INFO] Download list unchanged.')
+            return
 
     with open(DL_FILE, 'w', encoding='utf-8') as f:
         f.write(txt)

@@ -767,6 +767,61 @@ def extract_ajaxm_file_id(text: str) -> Optional[str]:
     return matches[-1]
 
 
+def extract_ajax_download_url(iframe_text: str, iframe_url: str) -> Optional[str]:
+    """POST target for one file page.
+
+    Older pages embed /ajaxm.php?file=id. Newer pages put an absolute
+    ajaxfile.php URL in domain1/domain2 instead.
+    """
+    if not iframe_text:
+        return None
+    matches = re.findall(
+        r"(?:https?://[^/'\"\s<>]+/)?ajax(?:m|file)\.php\?file=\d+",
+        iframe_text,
+    )
+    if not matches:
+        return None
+    chosen = matches[-1]
+    for item in reversed(matches):
+        file_id = item.rsplit("file=", 1)[-1]
+        if file_id != "1":
+            chosen = item
+            break
+    if chosen.startswith("http://") or chosen.startswith("https://"):
+        return chosen
+    return urljoin(iframe_url, "/" + chosen.lstrip("/"))
+
+
+_ACW_POS_LIST = (
+    15, 35, 29, 24, 33, 16, 1, 38, 10, 9, 19, 31, 40, 27, 22, 23, 25, 13, 6, 11,
+    39, 18, 20, 8, 14, 21, 32, 26, 2, 30, 7, 4, 17, 5, 3, 28, 34, 37, 12, 36,
+)
+_ACW_MASK = "3000176000856006061501533003690027800375"
+
+
+def calc_acw_sc_v2(arg1: str) -> str:
+    """Aliyun ESA cookie derived from the challenge page's arg1."""
+    out = [""] * 40
+    for index, char in enumerate(arg1):
+        for slot, pos in enumerate(_ACW_POS_LIST):
+            if pos == index + 1:
+                out[slot] = char
+    mixed = "".join(out)
+    parts: List[str] = []
+    width = min(len(mixed), len(_ACW_MASK))
+    for index in range(0, width, 2):
+        xored = int(mixed[index:index + 2], 16) ^ int(_ACW_MASK[index:index + 2], 16)
+        parts.append(f"{xored:02x}")
+    return "".join(parts)
+
+
+def extract_acw_arg1(html: str) -> Optional[str]:
+    match = re.search(r"var\s+arg1\s*=\s*['\"]([0-9A-Fa-f]{40})['\"]", html or "")
+    if not match:
+        return None
+    return match.group(1)
+
+
 def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional[str]:
     if timeout_ms <= 0:
         return None
@@ -777,25 +832,60 @@ def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Referer": referer or url,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+            "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+        ),
+        "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",
+        # The file host answers with a redirect only when the retry carries this header.
+        "X-Requested-With": "mark.via",
     }
-    try:
-        resp = SESSION.get(
-            url,
-            headers=headers,
-            timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
-        )
-    except Exception:
-        return None
-    try:
-        if resp.status_code >= 400:
+    # A private session keeps the challenge cookie on this host. The shared
+    # session would replace an explicit Cookie header and drop it.
+    session = requests.Session()
+    text = ""
+    response_url = url
+    acw_cookie = ""
+    for _ in range(3):
+        request_timeout_ms = remaining_timeout_ms(deadline_ts, 30000)
+        if request_timeout_ms <= 0:
             return None
-        text = resp.text
-        response_url = resp.url
-    finally:
         try:
-            resp.close()
+            resp = session.get(
+                url,
+                headers=headers,
+                cookies={"acw_sc__v2": acw_cookie} if acw_cookie else None,
+                timeout=bounded_timeout_s(request_timeout_ms, min_s=1.0, max_s=30.0),
+                allow_redirects=False,
+            )
         except Exception:
-            pass
+            return None
+        try:
+            if resp.status_code >= 400:
+                return None
+            location = resp.headers.get("Location") or resp.headers.get("location") or ""
+            if resp.status_code in (301, 302, 303, 307, 308) and location:
+                if location.startswith("/"):
+                    location = urljoin(resp.url or url, location)
+                if location.startswith("http://") or location.startswith("https://"):
+                    return location
+                return None
+            text = resp.text
+            response_url = resp.url or url
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        arg1 = extract_acw_arg1(text)
+        if not arg1:
+            break
+        new_cookie = calc_acw_sc_v2(arg1)
+        if new_cookie == acw_cookie:
+            break
+        acw_cookie = new_cookie
 
     # toolsdown 页里可能有多组 file/sign；只取真正下载按钮 down_r(el) 里的那组。
     match = re.search(
@@ -821,7 +911,7 @@ def resolve_lanrar_ajax_url(url: str, referer: str, timeout_ms: int) -> Optional
     if request_timeout_ms <= 0:
         return None
     try:
-        ajax_resp = SESSION.post(
+        ajax_resp = session.post(
             ajax_url,
             headers=ajax_headers,
             data=payload,
@@ -1534,14 +1624,13 @@ def resolve_item_candidate_url(item_url: str, referer: str, timeout_ms: int) -> 
         if iframe_resp.status_code >= 400:
             return None, None, f"iframe_status:{iframe_resp.status_code}"
         iframe_text = iframe_resp.text
-        ajax_file_id = extract_ajaxm_file_id(iframe_text)
+        ajax_url = extract_ajax_download_url(iframe_text, iframe_resp.url)
         ajaxdata = extract_js_var(iframe_text, "ajaxdata")
         wp_sign = extract_js_var(iframe_text, "wp_sign")
         websign = extract_js_field_value(iframe_text, "websign")
         kdns = extract_js_var(iframe_text, "kdns") or "1"
-        if not (ajax_file_id and ajaxdata and wp_sign):
+        if not (ajax_url and ajaxdata and wp_sign):
             return None, None, "ajaxm_params_missing"
-        ajax_url = urljoin(iframe_resp.url, f"/ajaxm.php?file={ajax_file_id}")
     finally:
         try:
             iframe_resp.close()

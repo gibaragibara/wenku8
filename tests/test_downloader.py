@@ -238,5 +238,88 @@ class DownloaderHelpersTest(unittest.TestCase):
             response.iter_content.assert_not_called()
 
 
+class AjaxFilePageTest(unittest.TestCase):
+    def test_extracts_absolute_ajaxfile_url(self):
+        html = """
+        var domain2 = 'https://apifile.lanzouw.com/ajaxfile.php?file=123456';
+        var ajaxdata = 'abcd';
+        var wp_sign = 'sig';
+        """
+        self.assertEqual(
+            downloader.extract_ajax_download_url(html, "https://wenku8.lanzov.com/fn"),
+            "https://apifile.lanzouw.com/ajaxfile.php?file=123456",
+        )
+
+    def test_extracts_legacy_relative_ajaxm_url(self):
+        html = "var x = '/ajaxm.php?file=1'; $.post('/ajaxm.php?file=9988', data);"
+        self.assertEqual(
+            downloader.extract_ajax_download_url(html, "https://wenku8.lanzov.com/fn"),
+            "https://wenku8.lanzov.com/ajaxm.php?file=9988",
+        )
+
+    def test_acw_cookie_is_stable_hex(self):
+        cookie = downloader.calc_acw_sc_v2("79535309B5B73E5961D84737FEC23C6F4F027F4A")
+        self.assertEqual(len(cookie), 40)
+        self.assertRegex(cookie, r"^[0-9a-f]{40}$")
+        self.assertEqual(cookie, downloader.calc_acw_sc_v2("79535309B5B73E5961D84737FEC23C6F4F027F4A"))
+
+    def test_extract_acw_arg1(self):
+        html = "var arg1='37EAB765A2E11E6F44CF4E4B95B3EADA60ED2AEB';"
+        self.assertEqual(
+            downloader.extract_acw_arg1(html),
+            "37EAB765A2E11E6F44CF4E4B95B3EADA60ED2AEB",
+        )
+        self.assertIsNone(downloader.extract_acw_arg1("<html>no challenge</html>"))
+
+    def test_lanrar_challenge_returns_redirect_with_cookie(self):
+        arg1 = "79535309B5B73E5961D84737FEC23C6F4F027F4A"
+        expected_cookie = downloader.calc_acw_sc_v2(arg1)
+        final_url = "https://cdn.example.test/book.zip"
+
+        class FakeResponse:
+            def __init__(self, status_code, text="", location=""):
+                self.status_code = status_code
+                self.text = text
+                self.url = "https://developer.example.test/file/"
+                self.headers = {"Location": location} if location else {}
+
+            def close(self):
+                pass
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, headers=None, cookies=None, timeout=None, allow_redirects=None):
+                self.calls.append(
+                    {
+                        "headers": headers or {},
+                        "cookies": cookies,
+                        "allow_redirects": allow_redirects,
+                    }
+                )
+                if len(self.calls) == 1:
+                    return FakeResponse(200, f"var arg1='{arg1}';")
+                return FakeResponse(302, location=final_url)
+
+            def post(self, *args, **kwargs):
+                raise AssertionError("ajax.php should not be called after a redirect")
+
+        fake = FakeSession()
+        with mock.patch.object(downloader.requests, "Session", return_value=fake):
+            resolved = downloader.resolve_lanrar_ajax_url(
+                "https://developer.example.test/file/?id=1",
+                "https://wenku8.lanzov.com/fn",
+                30000,
+            )
+
+        self.assertEqual(resolved, final_url)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertIsNone(fake.calls[0]["cookies"])
+        self.assertEqual(fake.calls[1]["cookies"], {"acw_sc__v2": expected_cookie})
+        self.assertEqual(fake.calls[1]["headers"]["X-Requested-With"], "mark.via")
+        self.assertFalse(fake.calls[1]["allow_redirects"])
+
+
 if __name__ == "__main__":
     unittest.main()
