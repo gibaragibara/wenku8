@@ -263,6 +263,7 @@ def load_all_entry_signatures(merged_csv_path: Path) -> Dict[str, str]:
 
 def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "") -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
+    seen_labels = set()
     needle = name_contains.strip().lower()
     with merged_csv_path.open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -270,9 +271,16 @@ def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "")
             label = (row.get("dl_label") or "").strip()
             if not label:
                 continue
+            # A share link can be referenced by several rows (e.g. one post per
+            # volume). Downloading the share once already extracts every volume,
+            # and state.json only stores one entry signature per label, so the
+            # duplicates would otherwise redownload each other forever.
+            if label in seen_labels:
+                continue
             title = (row.get("main") or row.get("title") or label).strip()
             if needle and needle not in title.lower():
                 continue
+            seen_labels.add(label)
             entries.append(
                 {
                     "title": title,

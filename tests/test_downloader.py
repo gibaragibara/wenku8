@@ -58,6 +58,25 @@ class DownloaderHelpersTest(unittest.TestCase):
             "药师少女的独语 - 16.epub",
         )
 
+    def test_load_entries_keeps_one_entry_per_share_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            merged = Path(tmp) / "merged.csv"
+            merged.write_text(
+                "main,volume,dl_label,dl_pwd,dl_update,dl_remark\n"
+                "赤色博物馆,3,b00g48wiyj,6sqa,2026-07-08,网译\n"
+                "赤色博物馆,2,b00g48wiyj,6sqa,2026-07-08,网译\n"
+                "别的书,1,b00g4abcde,x,2026-07-09,台版\n",
+                encoding="utf-8",
+            )
+
+            entries = downloader.load_entries(merged)
+
+            self.assertEqual(
+                [entry["label"] for entry in entries],
+                ["b00g48wiyj", "b00g4abcde"],
+            )
+            self.assertEqual(entries[0]["volume"], "3")
+
     def test_copy_epubs_to_output_drops_share_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "archives"
