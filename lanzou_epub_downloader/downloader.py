@@ -230,36 +230,31 @@ def load_all_labels(merged_csv_path: Path) -> List[str]:
     return labels
 
 
-SIGNATURE_VERSION = 2
+SIGNATURE_VERSION = 3
 
 
 def build_entry_signature(entry: Dict[str, str]) -> str:
     # The share link is the unit of download: every catalog row for the same
     # label points at the same Lanzou share, and merged.csv can list several
     # rows for it (one post per volume, sorted by update date with unstable
-    # ties). Title/volume must therefore stay out of the signature, otherwise
-    # the row order flips the signature between runs and the share is treated
-    # as "updated" and downloaded again forever.
-    return share_signature(entry.get("update"), entry.get("remark"))
+    # ties). Row-level fields (title/volume/remark) must therefore stay out of
+    # the signature, otherwise the row order flips the signature between runs
+    # and the share is treated as "updated" and downloaded again forever.
+    return share_signature(entry.get("update"))
 
 
-def share_signature(update: Optional[str], remark: Optional[str]) -> str:
-    payload = {
-        "update": (update or "").strip(),
-        "remark": (remark or "").strip(),
-    }
+def share_signature(update: Optional[str]) -> str:
+    payload = {"update": (update or "").strip()}
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def migrate_state_signatures(state: Dict[str, dict]) -> Dict[str, dict]:
-    """Rewrite pre-v2 (title/volume based) signatures without re-downloading."""
+    """Rewrite pre-v3 (row based) signatures without re-downloading."""
     if state.get("signature_version") == SIGNATURE_VERSION:
         return state
     for payload in (state.get("labels") or {}).values():
-        if "entry_update" in payload or "entry_remark" in payload:
-            payload["entry_signature"] = share_signature(
-                payload.get("entry_update"), payload.get("entry_remark")
-            )
+        if "entry_update" in payload:
+            payload["entry_signature"] = share_signature(payload.get("entry_update"))
     state["signature_version"] = SIGNATURE_VERSION
     return state
 
@@ -284,9 +279,23 @@ def load_all_entry_signatures(merged_csv_path: Path) -> Dict[str, str]:
     return signatures
 
 
+def load_all_entry_signatures(merged_csv_path: Path) -> Dict[str, str]:
+    updates: Dict[str, str] = {}
+    with merged_csv_path.open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            label = (row.get("dl_label") or "").strip()
+            if not label:
+                continue
+            update = (row.get("dl_update") or row.get("update") or "").strip()
+            if label not in updates or update > updates[label]:
+                updates[label] = update
+    return {label: share_signature(update) for label, update in updates.items()}
+
+
 def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "") -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
-    seen_labels = set()
+    by_label: Dict[str, Dict[str, str]] = {}
     needle = name_contains.strip().lower()
     with merged_csv_path.open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -294,26 +303,30 @@ def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "")
             label = (row.get("dl_label") or "").strip()
             if not label:
                 continue
-            # A share link can be referenced by several rows (e.g. one post per
-            # volume). Downloading the share once already extracts every volume,
-            # and state.json only stores one entry signature per label, so the
-            # duplicates would otherwise redownload each other forever.
-            if label in seen_labels:
-                continue
             title = (row.get("main") or row.get("title") or label).strip()
             if needle and needle not in title.lower():
                 continue
-            seen_labels.add(label)
-            entries.append(
-                {
-                    "title": title,
-                    "volume": (row.get("volume") or "").strip(),
-                    "label": label,
-                    "pwd": (row.get("dl_pwd") or "").strip(),
-                    "update": (row.get("dl_update") or row.get("update") or "").strip(),
-                    "remark": (row.get("dl_remark") or "").strip(),
-                }
-            )
+            update = (row.get("dl_update") or row.get("update") or "").strip()
+            # A share link can be referenced by several rows (e.g. one post per
+            # volume). Downloading the share once already extracts every volume,
+            # and state.json only stores one entry signature per label, so the
+            # duplicates would otherwise redownload each other forever. Keep the
+            # newest update date so the signature cannot flip with row order.
+            existing = by_label.get(label)
+            if existing is not None:
+                if update > existing["update"]:
+                    existing["update"] = update
+                continue
+            entry = {
+                "title": title,
+                "volume": (row.get("volume") or "").strip(),
+                "label": label,
+                "pwd": (row.get("dl_pwd") or "").strip(),
+                "update": update,
+                "remark": (row.get("dl_remark") or "").strip(),
+            }
+            by_label[label] = entry
+            entries.append(entry)
             if limit > 0 and len(entries) >= limit:
                 break
     return entries

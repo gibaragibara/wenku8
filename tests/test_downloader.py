@@ -86,7 +86,7 @@ class DownloaderHelpersTest(unittest.TestCase):
             "remark": "网译",
             "pwd": "6sqa",
         }
-        sibling = dict(base, title="赤色博物馆 (2)", volume="2")
+        sibling = dict(base, title="赤色博物馆 (2)", volume="2", remark="")
 
         self.assertEqual(
             downloader.build_entry_signature(base),
@@ -132,9 +132,28 @@ class DownloaderHelpersTest(unittest.TestCase):
             stored = state["labels"]["b00g48wiyj"]
             self.assertEqual(
                 stored["entry_signature"],
-                downloader.share_signature("2026-07-08", "网译"),
+                downloader.share_signature("2026-07-08"),
             )
             self.assertEqual(state["signature_version"], downloader.SIGNATURE_VERSION)
+
+    def test_load_entries_uses_newest_update_for_shared_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            merged = Path(tmp) / "merged.csv"
+            merged.write_text(
+                "main,volume,dl_label,dl_pwd,dl_update,dl_remark\n"
+                "葬送的芙莉莲,1,b00g4ksxoh,pw,2026-07-08,台版\n"
+                "葬送的芙莉莲～前奏～,2,b00g4ksxoh,pw,2026-09-01,台版\n",
+                encoding="utf-8",
+            )
+
+            entries = downloader.load_entries(merged)
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["update"], "2026-09-01")
+            self.assertEqual(
+                downloader.build_entry_signature(entries[0]),
+                downloader.share_signature("2026-09-01"),
+            )
 
     def test_copy_epubs_to_output_drops_share_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
