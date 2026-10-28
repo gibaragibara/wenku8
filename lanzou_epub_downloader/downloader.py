@@ -230,15 +230,38 @@ def load_all_labels(merged_csv_path: Path) -> List[str]:
     return labels
 
 
+SIGNATURE_VERSION = 2
+
+
 def build_entry_signature(entry: Dict[str, str]) -> str:
+    # The share link is the unit of download: every catalog row for the same
+    # label points at the same Lanzou share, and merged.csv can list several
+    # rows for it (one post per volume, sorted by update date with unstable
+    # ties). Title/volume must therefore stay out of the signature, otherwise
+    # the row order flips the signature between runs and the share is treated
+    # as "updated" and downloaded again forever.
+    return share_signature(entry.get("update"), entry.get("remark"))
+
+
+def share_signature(update: Optional[str], remark: Optional[str]) -> str:
     payload = {
-        "title": (entry.get("title") or "").strip(),
-        "volume": (entry.get("volume") or "").strip(),
-        "update": (entry.get("update") or "").strip(),
-        "remark": (entry.get("remark") or "").strip(),
-        "pwd": (entry.get("pwd") or "").strip(),
+        "update": (update or "").strip(),
+        "remark": (remark or "").strip(),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def migrate_state_signatures(state: Dict[str, dict]) -> Dict[str, dict]:
+    """Rewrite pre-v2 (title/volume based) signatures without re-downloading."""
+    if state.get("signature_version") == SIGNATURE_VERSION:
+        return state
+    for payload in (state.get("labels") or {}).values():
+        if "entry_update" in payload or "entry_remark" in payload:
+            payload["entry_signature"] = share_signature(
+                payload.get("entry_update"), payload.get("entry_remark")
+            )
+    state["signature_version"] = SIGNATURE_VERSION
+    return state
 
 
 def load_all_entry_signatures(merged_csv_path: Path) -> Dict[str, str]:
@@ -298,7 +321,13 @@ def load_entries(merged_csv_path: Path, limit: int = 0, name_contains: str = "")
 
 def load_state(path: Path) -> Dict[str, dict]:
     if not path.exists():
-        return {"labels": {}, "baseline_labels": [], "baseline_entries": {}, "baseline_created_at": ""}
+        return {
+            "labels": {},
+            "baseline_labels": [],
+            "baseline_entries": {},
+            "baseline_created_at": "",
+            "signature_version": SIGNATURE_VERSION,
+        }
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -307,9 +336,15 @@ def load_state(path: Path) -> Dict[str, dict]:
         data.setdefault("baseline_labels", [])
         data.setdefault("baseline_entries", {})
         data.setdefault("baseline_created_at", "")
-        return data
+        return migrate_state_signatures(data)
     except Exception:
-        return {"labels": {}, "baseline_labels": [], "baseline_entries": {}, "baseline_created_at": ""}
+        return {
+            "labels": {},
+            "baseline_labels": [],
+            "baseline_entries": {},
+            "baseline_created_at": "",
+            "signature_version": SIGNATURE_VERSION,
+        }
 
 
 def save_state(path: Path, state: Dict[str, dict]) -> None:

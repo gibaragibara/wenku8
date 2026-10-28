@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import time
@@ -76,6 +77,64 @@ class DownloaderHelpersTest(unittest.TestCase):
                 ["b00g48wiyj", "b00g4abcde"],
             )
             self.assertEqual(entries[0]["volume"], "3")
+
+    def test_entry_signature_is_share_level_not_row_level(self):
+        base = {
+            "title": "赤色博物馆",
+            "volume": "3",
+            "update": "2026-07-08",
+            "remark": "网译",
+            "pwd": "6sqa",
+        }
+        sibling = dict(base, title="赤色博物馆 (2)", volume="2")
+
+        self.assertEqual(
+            downloader.build_entry_signature(base),
+            downloader.build_entry_signature(sibling),
+        )
+        self.assertNotEqual(
+            downloader.build_entry_signature(base),
+            downloader.build_entry_signature(dict(base, update="2026-07-09")),
+        )
+
+    def test_load_state_migrates_legacy_signature_without_redownload(self):
+        legacy = json.dumps(
+            {
+                "pwd": "6sqa",
+                "remark": "网译",
+                "title": "赤色博物馆",
+                "update": "2026-07-08",
+                "volume": "3",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "labels": {
+                            "b00g48wiyj": {
+                                "entry_signature": legacy,
+                                "entry_update": "2026-07-08",
+                                "entry_remark": "网译",
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            state = downloader.load_state(state_path)
+
+            stored = state["labels"]["b00g48wiyj"]
+            self.assertEqual(
+                stored["entry_signature"],
+                downloader.share_signature("2026-07-08", "网译"),
+            )
+            self.assertEqual(state["signature_version"], downloader.SIGNATURE_VERSION)
 
     def test_copy_epubs_to_output_drops_share_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
